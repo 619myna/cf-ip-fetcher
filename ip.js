@@ -5,7 +5,7 @@ module.exports = async (req, res) => {
         // 数据源列表
         const dataSources = [
             'https://ipdb.api.030101.xyz/?type=bestcf',
-            'https://ip.164746.xyz/ipTop10.html', 
+            'https://ip.164746.xyz/ipTop.html', 
             'https://stock.hostmonit.com/CloudFlareYes',
             'https://www.wetest.vip/page/cloudflare/address_v4.html'
         ];
