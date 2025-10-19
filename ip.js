@@ -1,7 +1,28 @@
 const https = require('https');
 
+// 缓存变量
+let cache = {
+    data: null,
+    timestamp: 0,
+    ttl: 60000 // 1分钟缓存，单位毫秒
+};
+
 module.exports = async (req, res) => {
     try {
+        // 检查缓存是否有效
+        const now = Date.now();
+        if (cache.data && (now - cache.timestamp) < cache.ttl) {
+            console.log('返回缓存数据');
+            // 设置响应头
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('X-Cache', 'HIT');
+            res.setHeader('X-Cache-Expire', new Date(cache.timestamp + cache.ttl).toISOString());
+            
+            // 返回缓存数据
+            return res.end(cache.data);
+        }
+
         // 数据源列表
         const dataSources = [
             'https://ipdb.api.030101.xyz/?type=bestcf',
@@ -30,15 +51,37 @@ module.exports = async (req, res) => {
         // 去重并排序
         const uniqueIPs = [...new Set(allIPs)].sort();
         
+        // 格式化为文本
+        const resultText = uniqueIPs.join('\n');
+        
+        // 更新缓存
+        cache.data = resultText;
+        cache.timestamp = now;
+        
+        console.log(`获取完成，共 ${uniqueIPs.length} 个唯一IP，缓存已更新`);
+
         // 设置响应头
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('X-Cache', 'MISS');
+        res.setHeader('X-Cache-Expire', new Date(now + cache.ttl).toISOString());
         
-        // 返回格式化的IP列表（每行一个）
-        res.end(uniqueIPs.join('\n'));
+        // 返回IP列表
+        res.end(resultText);
         
     } catch (error) {
         console.error('全局错误:', error);
+        
+        // 如果缓存有数据，即使出错也返回缓存数据
+        if (cache.data) {
+            console.log('发生错误，返回缓存数据作为降级方案');
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('X-Cache', 'HIT-FALLBACK');
+            res.setHeader('X-Cache-Expire', new Date(cache.timestamp + cache.ttl).toISOString());
+            return res.end(cache.data);
+        }
+        
         res.status(500).end('Error: ' + error.message);
     }
 };
@@ -46,7 +89,7 @@ module.exports = async (req, res) => {
 // 获取数据函数
 function fetchData(url) {
     return new Promise((resolve, reject) => {
-        https.get(url, (response) => {
+        const req = https.get(url, (response) => {
             // 处理重定向
             if (response.statusCode === 301 || response.statusCode === 302) {
                 const redirectUrl = response.headers.location;
@@ -62,6 +105,12 @@ function fetchData(url) {
             response.on('data', (chunk) => rawData += chunk);
             response.on('end', () => resolve(rawData));
         }).on('error', reject);
+        
+        // 设置超时（10秒）
+        req.setTimeout(10000, () => {
+            req.destroy();
+            reject(new Error('Request timeout'));
+        });
     });
 }
 
@@ -140,4 +189,4 @@ function extractIPs(data, source) {
         if (parts[0] === '192' && parts[1] === '168') return false;
         return true;
     });
-}
+            }
