@@ -1,4 +1,5 @@
 const https = require('https');
+const net = require('net');
 
 // 缓存变量
 let cache = {
@@ -23,14 +24,14 @@ module.exports = async (req, res) => {
             return res.end(cache.data);
         }
 
-        // 数据源列表
+        // 数据源列表（补充了缺少的逗号）
         const dataSources = [
             'https://ipdb.api.030101.xyz/?type=bestcf',
             'https://ip.164746.xyz/ipTop.html', 
             'https://stock.hostmonit.com/CloudFlareYes',
-            'https://stock.hostmonit.com/CloudFlareYesV6'
+            'https://stock.hostmonit.com/CloudFlareYesV6',
             'https://www.wetest.vip/page/cloudflare/address_v4.html',
-            'https://www.wetest.vip/page/cloudflare/address_v6.html'
+            'https://www.wetest.vip/page/cloudflare/address_v6.html',
             'https://api.urlce.com/cloudflare.html'
         ];
 
@@ -117,79 +118,80 @@ function fetchData(url) {
     });
 }
 
-// 从不同数据源提取IP地址
+// 从不同数据源提取 IPv4 与 IPv6 地址
 function extractIPs(data, source) {
+    let rawCandidates = [];
+    
+    // 1. 尝试 JSON 格式提取
+    if (source.includes('ipdb.api.030101.xyz') || source.includes('stock.hostmonit.com')) {
+        try {
+            const jsonData = JSON.parse(data);
+            const list = jsonData.data || jsonData.info || [];
+            if (Array.isArray(list)) {
+                list.forEach(item => {
+                    if (item.ip && typeof item.ip === 'string') {
+                        rawCandidates.push(item.ip.trim());
+                    }
+                });
+            }
+        } catch (e) {
+            // JSON 解析失败则回退到全局正则匹配
+        }
+    }
+
+    // 2. 如果未从 JSON 结构化提取出数据，则通过正则提取全文本中的候选 IP
+    if (rawCandidates.length === 0) {
+        rawCandidates = matchAllIPs(data);
+    }
+
+    // 3. 过滤并保留公网 IPv4 / IPv6 地址
+    return rawCandidates.filter(ip => isPublicIP(ip));
+}
+
+// 正则提取文本中的所有 IPv4 / IPv6 字符串
+function matchAllIPs(text) {
     const ips = [];
     
-    // IP地址正则表达式（匹配IPv4）
-    const ipRegex = /\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g;
-    
-    // 根据数据源进行不同的处理
-    if (source.includes('ipdb.api.030101.xyz')) {
-        // JSON格式处理
-        try {
-            const jsonData = JSON.parse(data);
-            if (jsonData && Array.isArray(jsonData.data)) {
-                jsonData.data.forEach(item => {
-                    if (item.ip && typeof item.ip === 'string') {
-                        const match = item.ip.match(ipRegex);
-                        if (match) ips.push(...match);
-                    }
-                });
-            }
-        } catch (e) {
-            // 如果JSON解析失败，回退到文本提取
-            const matches = data.match(ipRegex);
-            if (matches) ips.push(...matches);
-        }
-    }
-    else if (source.includes('stock.hostmonit.com')) {
-        // JSON格式处理
-        try {
-            const jsonData = JSON.parse(data);
-            if (jsonData && Array.isArray(jsonData.info)) {
-                jsonData.info.forEach(item => {
-                    if (item.ip && typeof item.ip === 'string') {
-                        const match = item.ip.match(ipRegex);
-                        if (match) ips.push(...match);
-                    }
-                });
-            }
-        } catch (e) {
-            const matches = data.match(ipRegex);
-            if (matches) ips.push(...matches);
-        }
-    }
-    else if (source.includes('wetest.vip')) {
-        // HTML表格处理
-        const tableMatches = data.match(/<td[^>]*>(\d+\.\d+\.\d+\.\d+)<\/td>/g);
-        if (tableMatches) {
-            tableMatches.forEach(td => {
-                const ipMatch = td.match(ipRegex);
-                if (ipMatch) ips.push(...ipMatch);
-            });
-        } else {
-            // 回退到通用IP提取
-            const matches = data.match(ipRegex);
-            if (matches) ips.push(...matches);
-        }
-    }
-    else {
-        // 通用处理：提取所有IP地址
-        const matches = data.match(ipRegex);
-        if (matches) ips.push(...matches);
-    }
-    
-    // 过滤有效的IP地址（排除本地和私有IP）
-    return ips.filter(ip => {
-        const parts = ip.split('.');
-        // 排除 0.x.x.x, 10.x.x.x, 127.x.x.x, 169.254.x.x, 172.16.x.x-172.31.x.x, 192.168.x.x
-        if (parts[0] === '0') return false;
-        if (parts[0] === '10') return false;
-        if (parts[0] === '127') return false;
-        if (parts[0] === '169' && parts[1] === '254') return false;
-        if (parts[0] === '172' && parseInt(parts[1]) >= 16 && parseInt(parts[1]) <= 31) return false;
-        if (parts[0] === '192' && parts[1] === '168') return false;
+    // IPv4 正则
+    const ipv4Regex = /\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g;
+    const v4Matches = text.match(ipv4Regex);
+    if (v4Matches) ips.push(...v4Matches);
+
+    // IPv6 正则（匹配全写与压缩简写形式）
+    const ipv6Regex = /(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?:(?::[0-9a-fA-F]{1,4}){1,6})|:(?:(?::[0-9a-fA-F]{1,4}){1,7}|:))/g;
+    const v6Matches = text.match(ipv6Regex);
+    if (v6Matches) ips.push(...v6Matches);
+
+    return ips;
+}
+
+// 检查是否为有效公网 IP (包含 IPv4 与 IPv6)
+function isPublicIP(ip) {
+    const ipType = net.isIP(ip);
+
+    // IPv4 公网判断
+    if (ipType === 4) {
+        const parts = ip.split('.').map(Number);
+        if (parts[0] === 0) return false;
+        if (parts[0] === 10) return false;
+        if (parts[0] === 127) return false;
+        if (parts[0] === 169 && parts[1] === 254) return false;
+        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;
+        if (parts[0] === 192 && parts[1] === 168) return false;
         return true;
-    });
-            }
+    }
+
+    // IPv6 公网判断
+    if (ipType === 6) {
+        const lower = ip.toLowerCase();
+        // 排除环回与未指定地址 (::, ::1)
+        if (lower === '::' || lower === '::1') return false;
+        // 排除链路本地地址 (fe80::/10)
+        if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) return false;
+        // 排除唯一本地私网地址 (fc00::/7)
+        if (lower.startsWith('fc') || lower.startsWith('fd')) return false;
+        return true;
+    }
+
+    return false;
+}
