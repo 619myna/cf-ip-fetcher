@@ -1,5 +1,4 @@
 const https = require('https');
-const net = require('net');
 
 // 缓存变量
 let cache = {
@@ -14,17 +13,14 @@ module.exports = async (req, res) => {
         const now = Date.now();
         if (cache.data && (now - cache.timestamp) < cache.ttl) {
             console.log('返回缓存数据');
-            // 设置响应头
             res.setHeader('Content-Type', 'text/plain; charset=utf-8');
             res.setHeader('Access-Control-Allow-Origin', '*');
             res.setHeader('X-Cache', 'HIT');
             res.setHeader('X-Cache-Expire', new Date(cache.timestamp + cache.ttl).toISOString());
-            
-            // 返回缓存数据
             return res.end(cache.data);
         }
 
-        // 数据源列表
+        // 数据源列表（修复了原代码缺少逗号的问题）
         const dataSources = [
             'https://ipdb.api.030101.xyz/?type=bestcf',
             'https://ip.164746.xyz/ipTop.html', 
@@ -35,6 +31,169 @@ module.exports = async (req, res) => {
             'https://api.urlce.com/cloudflare.html'
         ];
 
+        let allIPs = [];
+
+        // 依次获取每个数据源
+        for (const source of dataSources) {
+            try {
+                console.log(`正在获取: ${source}`);
+                const data = await fetchData(source);
+                const ips = extractIPs(data, source);
+                allIPs = allIPs.concat(ips);
+                console.log(`从 ${source} 获取到 ${ips.length} 个IP`);
+            } catch (error) {
+                console.log(`获取 ${source} 失败: ${error.message}`);
+                continue;
+            }
+        }
+
+        // 去重并排序（排序按字符串顺序，IPv4和IPv6混合排序可能不完美，但可接受）
+        const uniqueIPs = [...new Set(allIPs)].sort();
+        
+        // 格式化为文本
+        const resultText = uniqueIPs.join('\n');
+        
+        // 更新缓存
+        cache.data = resultText;
+        cache.timestamp = now;
+        
+        console.log(`获取完成，共 ${uniqueIPs.length} 个唯一IP，缓存已更新`);
+
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('X-Cache', 'MISS');
+        res.setHeader('X-Cache-Expire', new Date(now + cache.ttl).toISOString());
+        res.end(resultText);
+        
+    } catch (error) {
+        console.error('全局错误:', error);
+        if (cache.data) {
+            console.log('发生错误，返回缓存数据作为降级方案');
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('X-Cache', 'HIT-FALLBACK');
+            res.setHeader('X-Cache-Expire', new Date(cache.timestamp + cache.ttl).toISOString());
+            return res.end(cache.data);
+        }
+        res.status(500).end('Error: ' + error.message);
+    }
+};
+
+// 获取数据函数
+function fetchData(url) {
+    return new Promise((resolve, reject) => {
+        const req = https.get(url, (response) => {
+            if (response.statusCode === 301 || response.statusCode === 302) {
+                const redirectUrl = response.headers.location;
+                return fetchData(redirectUrl).then(resolve).catch(reject);
+            }
+            if (response.statusCode !== 200) {
+                reject(new Error(`HTTP ${response.statusCode}`));
+                return;
+            }
+            let rawData = '';
+            response.on('data', (chunk) => rawData += chunk);
+            response.on('end', () => resolve(rawData));
+        }).on('error', reject);
+        req.setTimeout(10000, () => {
+            req.destroy();
+            reject(new Error('Request timeout'));
+        });
+    });
+}
+
+// 从不同数据源提取IP地址（同时支持IPv4和IPv6）
+function extractIPs(data, source) {
+    const ips = [];
+    
+    // IPv4 正则
+    const ipv4Regex = /\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g;
+    // IPv6 正则（匹配标准IPv6，包括压缩格式，但不匹配端口或括号）
+    const ipv6Regex = /\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b|\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\b|\b(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}\b|\b(?:[0-9a-fA-F]{1,4}:){1,5}:[0-9a-fA-F]{1,4}\b|\b(?:[0-9a-fA-F]{1,4}:){1,4}:[0-9a-fA-F]{1,4}\b|\b(?:[0-9a-fA-F]{1,4}:){1,3}:[0-9a-fA-F]{1,4}\b|\b(?:[0-9a-fA-F]{1,4}:){1,2}:[0-9a-fA-F]{1,4}\b|\b[0-9a-fA-F]{1,4}::(?:[0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4}\b|\b::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}\b|\b[0-9a-fA-F]{1,4}::[0-9a-fA-F]{1,4}\b|\b::\b/g;
+    // 合并正则（可同时匹配两者）
+    const ipCombinedRegex = /\b(?:(?:[0-9]{1,3}\.){3}[0-9]{1,3}|(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,4}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,3}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}:[0-9a-fA-F]{1,4}|[0-9a-fA-F]{1,4}::(?:[0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4}|::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}|[0-9a-fA-F]{1,4}::[0-9a-fA-F]{1,4}|::)\b/g;
+
+    // 根据数据源进行不同的处理（优先解析JSON，但最终都提取IP）
+    if (source.includes('ipdb.api.030101.xyz')) {
+        try {
+            const jsonData = JSON.parse(data);
+            if (jsonData && Array.isArray(jsonData.data)) {
+                jsonData.data.forEach(item => {
+                    if (item.ip && typeof item.ip === 'string') {
+                        const matches = item.ip.match(ipCombinedRegex);
+                        if (matches) ips.push(...matches);
+                    }
+                });
+            }
+        } catch (e) {
+            // 回退到文本提取
+            const matches = data.match(ipCombinedRegex);
+            if (matches) ips.push(...matches);
+        }
+    }
+    else if (source.includes('stock.hostmonit.com')) {
+        try {
+            const jsonData = JSON.parse(data);
+            if (jsonData && Array.isArray(jsonData.info)) {
+                jsonData.info.forEach(item => {
+                    if (item.ip && typeof item.ip === 'string') {
+                        const matches = item.ip.match(ipCombinedRegex);
+                        if (matches) ips.push(...matches);
+                    }
+                });
+            }
+        } catch (e) {
+            const matches = data.match(ipCombinedRegex);
+            if (matches) ips.push(...matches);
+        }
+    }
+    else if (source.includes('wetest.vip')) {
+        // HTML表格处理（可能含IPv4和IPv6）
+        const tableMatches = data.match(/<td[^>]*>([^<]+)<\/td>/g);
+        if (tableMatches) {
+            tableMatches.forEach(td => {
+                const matches = td.match(ipCombinedRegex);
+                if (matches) ips.push(...matches);
+            });
+        } else {
+            const matches = data.match(ipCombinedRegex);
+            if (matches) ips.push(...matches);
+        }
+    }
+    else {
+        // 通用处理：提取所有IP（IPv4+IPv6）
+        const matches = data.match(ipCombinedRegex);
+        if (matches) ips.push(...matches);
+    }
+    
+    // 过滤无效IP（私有、回环、链路本地等）
+    return ips.filter(ip => {
+        // 先判断IPv4
+        if (ip.includes('.')) {
+            const parts = ip.split('.');
+            if (parts[0] === '0' || parts[0] === '10' || parts[0] === '127') return false;
+            if (parts[0] === '169' && parts[1] === '254') return false;
+            if (parts[0] === '172' && parseInt(parts[1]) >= 16 && parseInt(parts[1]) <= 31) return false;
+            if (parts[0] === '192' && parts[1] === '168') return false;
+            return true;
+        } else {
+            // IPv6过滤（回环::1，链路本地fe80::/10，唯一本地fc00::/7，多播ff00::/8等）
+            const lower = ip.toLowerCase();
+            // 回环
+            if (lower === '::1') return false;
+            // 链路本地 (fe80::/10) - 前16位为0xfe80
+            if (lower.startsWith('fe80:')) return false;
+            // 唯一本地 (fc00::/7) - 前8位为fc或fd
+            if (lower.startsWith('fc') || lower.startsWith('fd')) return false;
+            // 多播 (ff00::/8)
+            if (lower.startsWith('ff')) return false;
+            // 未指定 (::)
+            if (lower === '::') return false;
+            // 其他保留或特殊地址可根据需要扩展
+            return true;
+        }
+    });
+}
         let allIPs = [];
 
         // 依次获取每个数据源
