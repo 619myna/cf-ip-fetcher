@@ -1,40 +1,120 @@
-// api/index.js (Vercel 标准Serverless入口)
-export const config = {
-  runtime: "edge", // 改用Edge Runtime，稳定性远高于Node.js Runtime
-  maxDuration: 15, // 最大执行时长15秒
-};
+const https = require('https');
 
-// 全局缓存
 let cache = {
-  data: null,
-  timestamp: 0,
-  ttl: 60000,
+    data: null,
+    timestamp: 0,
+    ttl: 60000 // 1分钟
 };
 
-// 轻量化高效正则（RFC4291标准，精简无冗余分组，性能极强）
-const ipv4Regex = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
-const ipv6Regex = /\b(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\b/g;
+module.exports = async (req, res) => {
+    try {
+        const now = Date.now();
+        if (cache.data && (now - cache.timestamp) < cache.ttl) {
+            console.log('返回缓存数据');
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('X-Cache', 'HIT');
+            res.setHeader('X-Cache-Expire', new Date(cache.timestamp + cache.ttl).toISOString());
+            return res.end(cache.data);
+        }
 
-// 私有IPv6前缀黑名单
-const privateV6Prefix = ['fe80:', 'fc', 'fd', 'ff', '::1', '::ffff:'];
+        const dataSources = [
+            'https://ipdb.api.030101.xyz/?type=bestcf',
+            'https://ip.164746.xyz/ipTop.html',
+            'https://stock.hostmonit.com/CloudFlareYes',
+            'https://stock.hostmonit.com/CloudFlareYesV6',
+            'https://www.wetest.vip/page/cloudflare/address_v4.html',
+            'https://www.wetest.vip/page/cloudflare/address_v6.html',
+            'https://api.urlce.com/cloudflare.html'
+        ];
 
-export default async function handler(req) {
-  const now = Date.now();
-  // 命中缓存直接返回
-  if (cache.data && now - cache.timestamp < cache.ttl) {
-    return new Response(cache.data, {
-      headers: {
-        "Content-Type": "text/plain; charset=utf-8",
-        "Access-Control-Allow-Origin": "*",
-        "X-Cache": "HIT",
-      },
+        let allIPs = [];
+
+        for (const source of dataSources) {
+            try {
+                console.log(`获取: ${source}`);
+                const data = await fetchData(source);
+                const ips = extractIPs(data);
+                allIPs = allIPs.concat(ips);
+                console.log(`从 ${source} 获得 ${ips.length} 个IP`);
+            } catch (err) {
+                console.log(`跳过 ${source}: ${err.message}`);
+            }
+        }
+
+        const uniqueIPs = [...new Set(allIPs)].sort();
+        const resultText = uniqueIPs.join('\n');
+
+        cache.data = resultText;
+        cache.timestamp = now;
+        console.log(`总计 ${uniqueIPs.length} 个唯一IP，缓存更新`);
+
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('X-Cache', 'MISS');
+        res.setHeader('X-Cache-Expire', new Date(now + cache.ttl).toISOString());
+        res.end(resultText);
+    } catch (error) {
+        console.error('全局错误:', error);
+        if (cache.data) {
+            console.log('返回陈旧缓存作为降级');
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('X-Cache', 'HIT-FALLBACK');
+            return res.end(cache.data);
+        }
+        res.status(500).end('Error: ' + error.message);
+    }
+};
+
+function fetchData(url) {
+    return new Promise((resolve, reject) => {
+        const req = https.get(url, (response) => {
+            if (response.statusCode === 301 || response.statusCode === 302) {
+                return fetchData(response.headers.location).then(resolve).catch(reject);
+            }
+            if (response.statusCode !== 200) {
+                reject(new Error(`HTTP ${response.statusCode}`));
+                return;
+            }
+            let raw = '';
+            response.on('data', chunk => raw += chunk);
+            response.on('end', () => resolve(raw));
+        });
+        req.setTimeout(10000, () => {
+            req.destroy();
+            reject(new Error('请求超时'));
+        });
+        req.on('error', reject);
     });
-  }
+}
 
-  const dataSources = [
-    "https://ipdb.api.030101.xyz/?type=bestcf",
-    "https://ip.164746.xyz/ipTop.html",
-    "https://stock.hostmonit.com/CloudFlareYes",
+function extractIPs(data) {
+    // 使用简单、安全的正则（避免回溯爆炸）
+    const ipv4Regex = /\b(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/g;
+    const ipv6Regex = /\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b|\b[0-9a-fA-F]{1,4}::[0-9a-fA-F]{1,4}\b|\b::[0-9a-fA-F]{1,4}\b|\b[0-9a-fA-F]{1,4}::\b|\b::\b/g;
+
+    const matches4 = data.match(ipv4Regex) || [];
+    const matches6 = data.match(ipv6Regex) || [];
+    const all = [...matches4, ...matches6];
+
+    // 过滤私有/保留地址
+    return all.filter(ip => {
+        if (ip.includes('.')) {
+            const p = ip.split('.');
+            if (p[0] === '0' || p[0] === '10' || p[0] === '127') return false;
+            if (p[0] === '169' && p[1] === '254') return false;
+            if (p[0] === '172' && parseInt(p[1]) >= 16 && parseInt(p[1]) <= 31) return false;
+            if (p[0] === '192' && p[1] === '168') return false;
+            return true;
+        } else {
+            const lower = ip.toLowerCase();
+            if (lower === '::1' || lower === '::') return false;
+            if (lower.startsWith('fe80:') || lower.startsWith('fc') || lower.startsWith('fd') || lower.startsWith('ff')) return false;
+            return true;
+        }
+    });
+}    "https://stock.hostmonit.com/CloudFlareYes",
     "https://stock.hostmonit.com/CloudFlareYesV6",
     "https://www.wetest.vip/page/cloudflare/address_v4.html",
     "https://www.wetest.vip/page/cloudflare/address_v6.html",
