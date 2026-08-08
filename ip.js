@@ -1,25 +1,24 @@
 const https = require('https');
 
-// 缓存变量
+// 简单内存缓存（实例存活期间有效）
 let cache = {
     data: null,
     timestamp: 0,
-    ttl: 60000 // 1分钟缓存，单位毫秒
+    ttl: 60000 // 1分钟
 };
 
 module.exports = async (req, res) => {
+    // 设置通用响应头
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
     try {
-        // 检查缓存是否有效
         const now = Date.now();
+        // 1. 检查缓存
         if (cache.data && (now - cache.timestamp) < cache.ttl) {
             console.log('返回缓存数据');
-            // 设置响应头
-            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-            res.setHeader('Access-Control-Allow-Origin', '*');
             res.setHeader('X-Cache', 'HIT');
             res.setHeader('X-Cache-Expire', new Date(cache.timestamp + cache.ttl).toISOString());
-            
-            // 返回缓存数据
             return res.end(cache.data);
         }
 
@@ -28,12 +27,131 @@ module.exports = async (req, res) => {
             'https://ipdb.api.030101.xyz/?type=bestcf',
             'https://ip.164746.xyz/ipTop.html', 
             'https://stock.hostmonit.com/CloudFlareYes',
-            //'https://stock.hostmonit.com/CloudFlareYesV6',
             'https://www.wetest.vip/page/cloudflare/address_v4.html',
-            //'https://www.wetest.vip/page/cloudflare/address_v6.html',
             'https://api.urlce.com/cloudflare.html'
         ];
 
+        console.log('开始并发请求所有数据源...');
+
+        // 2. 使用 Promise.allSettled 并发请求，不因单个源报错而阻塞整体
+        const results = await Promise.allSettled(
+            dataSources.map(async (source) => {
+                const data = await fetchData(source);
+                return extractIPs(data, source);
+            })
+        );
+
+        let allIPs = [];
+        results.forEach((result, index) => {
+            if (result.status === 'fulfilled') {
+                console.log(`数据源 [${dataSources[index]}] 成功获取 ${result.value.length} 个 IP`);
+                allIPs = allIPs.concat(result.value);
+            } else {
+                console.log(`数据源 [${dataSources[index]}] 失败: ${result.reason.message}`);
+            }
+        });
+
+        // 3. 去重排序
+        const uniqueIPs = [...new Set(allIPs)].sort();
+        const resultText = uniqueIPs.join('\n');
+
+        if (uniqueIPs.length > 0) {
+            // 更新缓存
+            cache.data = resultText;
+            cache.timestamp = now;
+            res.setHeader('X-Cache', 'MISS');
+            res.setHeader('X-Cache-Expire', new Date(now + cache.ttl).toISOString());
+            return res.end(resultText);
+        } else {
+            throw new Error('所有数据源均未获取到有效 IP');
+        }
+
+    } catch (error) {
+        console.error('全局错误:', error.message);
+        
+        // 降级策略：返回过期的缓存（如果有的话）
+        if (cache.data) {
+            console.log('发生错误，返回过期的缓存数据');
+            res.setHeader('X-Cache', 'HIT-FALLBACK');
+            return res.end(cache.data);
+        }
+        
+        // standard Node http response 方法
+        res.statusCode = 500;
+        res.end('Error: ' + error.message);
+    }
+};
+
+// 获取数据函数（优化了超时与重定向）
+function fetchData(url, redirectCount = 0) {
+    return new Promise((resolve, reject) => {
+        if (redirectCount > 3) {
+            return reject(new Error('重定向次数过多'));
+        }
+
+        const req = https.get(url, (response) => {
+            // 正确处理相对路径与绝对路径重定向
+            if (response.statusCode === 301 || response.statusCode === 302) {
+                const redirectLocation = response.headers.location;
+                if (!redirectLocation) return reject(new Error('301/302 未提供 Location Header'));
+                
+                // 处理相对路径重定向
+                const targetUrl = new URL(redirectLocation, url).toString();
+                return fetchData(targetUrl, redirectCount + 1).then(resolve).catch(reject);
+            }
+
+            if (response.statusCode !== 200) {
+                return reject(new Error(`HTTP ${response.statusCode}`));
+            }
+
+            let rawData = '';
+            response.on('data', (chunk) => rawData += chunk);
+            response.on('end', () => resolve(rawData));
+        }).on('error', reject);
+        
+        // 将单次请求超时缩短至 3.5 秒，避免 Vercel 10秒总限制崩溃
+        req.setTimeout(3500, () => {
+            req.destroy();
+            reject(new Error('请求超时 (3.5s)'));
+        });
+    });
+}
+
+// 提取 IP 的逻辑保持不变
+function extractIPs(data, source) {
+    const ips = [];
+    const ipRegex = /\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g;
+    
+    if (source.includes('ipdb.api.030101.xyz') || source.includes('stock.hostmonit.com')) {
+        try {
+            const jsonData = JSON.parse(data);
+            const list = jsonData.data || jsonData.info || [];
+            if (Array.isArray(list)) {
+                list.forEach(item => {
+                    if (item.ip && typeof item.ip === 'string') {
+                        const match = item.ip.match(ipRegex);
+                        if (match) ips.push(...match);
+                    }
+                });
+            }
+        } catch (e) {
+            const matches = data.match(ipRegex);
+            if (matches) ips.push(...matches);
+        }
+    } else {
+        const matches = data.match(ipRegex);
+        if (matches) ips.push(...matches);
+    }
+    
+    return ips.filter(ip => {
+        const parts = ip.split('.').map(Number);
+        if (parts[0] === 0 || parts[0] === 10 || parts[0] === 127) return false;
+        if (parts[0] === 169 && parts[1] === 254) return false;
+        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;
+        if (parts[0] === 192 && parts[1] === 168) return false;
+        return true;
+    });
+}
         let allIPs = [];
 
         // 依次获取每个数据源
