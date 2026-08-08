@@ -1,6 +1,4 @@
-const https = require('https');
-
-// 简单内存缓存（实例存活期间有效）
+// 内存缓存
 let cache = {
     data: null,
     timestamp: 0,
@@ -8,21 +6,19 @@ let cache = {
 };
 
 module.exports = async (req, res) => {
-    // 设置通用响应头
+    // 设置基础响应头
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Access-Control-Allow-Origin', '*');
 
     try {
         const now = Date.now();
-        // 1. 检查缓存
+        // 1. 命中缓存
         if (cache.data && (now - cache.timestamp) < cache.ttl) {
-            console.log('返回缓存数据');
             res.setHeader('X-Cache', 'HIT');
             res.setHeader('X-Cache-Expire', new Date(cache.timestamp + cache.ttl).toISOString());
             return res.end(cache.data);
         }
 
-        // 数据源列表
         const dataSources = [
             'https://ipdb.api.030101.xyz/?type=bestcf',
             'https://ip.164746.xyz/ipTop.html', 
@@ -31,9 +27,107 @@ module.exports = async (req, res) => {
             'https://api.urlce.com/cloudflare.html'
         ];
 
-        console.log('开始并发请求所有数据源...');
+        // 2. 并发请求所有数据源
+        const results = await Promise.allSettled(
+            dataSources.map(async (source) => {
+                const data = await fetchData(source);
+                return extractIPs(data, source);
+            })
+        );
 
-        // 2. 使用 Promise.allSettled 并发请求，不因单个源报错而阻塞整体
+        let allIPs = [];
+        results.forEach((result) => {
+            if (result.status === 'fulfilled') {
+                allIPs.push(...result.value);
+            }
+        });
+
+        // 去重排序
+        const uniqueIPs = [...new Set(allIPs)].sort();
+
+        // 3. 结果处理
+        if (uniqueIPs.length > 0) {
+            const resultText = uniqueIPs.join('\n');
+            cache.data = resultText;
+            cache.timestamp = now;
+
+            res.setHeader('X-Cache', 'MISS');
+            res.setHeader('X-Cache-Expire', new Date(now + cache.ttl).toISOString());
+            return res.end(resultText);
+        }
+
+        // 如果获取失败但有旧缓存，返回降级缓存
+        if (cache.data) {
+            res.setHeader('X-Cache', 'HIT-FALLBACK');
+            return res.end(cache.data);
+        }
+
+        res.statusCode = 500;
+        res.end('Error: Failed to fetch IPs from all sources');
+
+    } catch (error) {
+        console.error('Function Error:', error.message);
+        if (cache.data) {
+            res.setHeader('X-Cache', 'HIT-FALLBACK');
+            return res.end(cache.data);
+        }
+        res.statusCode = 500;
+        res.end('Server Error: ' + error.message);
+    }
+};
+
+// 使用现代原生 fetch 请求数据
+async function fetchData(url) {
+    // 强制 2.5 秒硬超时，防止挂起 Vercel 进程
+    const response = await fetch(url, {
+        signal: AbortSignal.timeout(2500),
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+    });
+
+    if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+    }
+
+    return await response.text();
+}
+
+// 提取 IP 逻辑
+function extractIPs(data, source) {
+    const ips = [];
+    const ipRegex = /\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g;
+
+    if (source.includes('ipdb.api.030101.xyz') || source.includes('stock.hostmonit.com')) {
+        try {
+            const jsonData = JSON.parse(data);
+            const list = jsonData.data || jsonData.info || [];
+            if (Array.isArray(list)) {
+                list.forEach(item => {
+                    if (item.ip && typeof item.ip === 'string') {
+                        const match = item.ip.match(ipRegex);
+                        if (match) ips.push(...match);
+                    }
+                });
+            }
+        } catch (e) {
+            const matches = data.match(ipRegex);
+            if (matches) ips.push(...matches);
+        }
+    } else {
+        const matches = data.match(ipRegex);
+        if (matches) ips.push(...matches);
+    }
+
+    return ips.filter(ip => {
+        const parts = ip.split('.').map(Number);
+        if (parts[0] === 0 || parts[0] === 10 || parts[0] === 127) return false;
+        if (parts[0] === 169 && parts[1] === 254) return false;
+        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;
+        if (parts[0] === 192 && parts[1] === 168) return false;
+        return true;
+    });
+}
         const results = await Promise.allSettled(
             dataSources.map(async (source) => {
                 const data = await fetchData(source);
