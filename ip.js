@@ -1,5 +1,5 @@
 const https = require('https');
-const net = require('net'); // 引入 net 模块以支持源码中的 net.isIP 判断
+const net = require('net');
 
 // 缓存变量
 let cache = {
@@ -14,13 +14,10 @@ module.exports = async (req, res) => {
         const now = Date.now();
         if (cache.data && (now - cache.timestamp) < cache.ttl) {
             console.log('返回缓存数据');
-            // 设置响应头
             res.setHeader('Content-Type', 'text/plain; charset=utf-8');
             res.setHeader('Access-Control-Allow-Origin', '*');
             res.setHeader('X-Cache', 'HIT');
             res.setHeader('X-Cache-Expire', new Date(cache.timestamp + cache.ttl).toISOString());
-            
-            // 返回缓存数据
             return res.end(cache.data);
         }
 
@@ -34,6 +31,162 @@ module.exports = async (req, res) => {
             'https://www.wetest.vip/page/cloudflare/address_v6.html',
             'https://api.urlce.com/cloudflare.html'
         ];
+
+        // 核心修复：并发请求并设置 3.5 秒绝对硬超时，防 Vercel 10s 死线崩溃
+        const fetchPromises = dataSources.map(source => 
+            safeHttpsFetch(source, 3500)
+                .then(data => ({ source, data }))
+                .catch(() => ({ source, data: null })) // 失败静默拦截，不影响全局
+        );
+
+        const results = await Promise.all(fetchPromises);
+        let allIPs = [];
+
+        results.forEach(result => {
+            if (result.data) {
+                const ips = extractIPs(result.data, result.source);
+                allIPs = allIPs.concat(ips);
+                console.log(`从 ${result.source} 提取到有效 IP`);
+            }
+        });
+
+        // 融合源码的去重与排序逻辑（IPv4排前，IPv6排后，按字母序）
+        const uniqueIPs = [...new Set(allIPs)].sort((a, b) => {
+            const aV4 = a.includes(".");
+            const bV4 = b.includes(".");
+            if (aV4 && !bV4) return -1;
+            if (!aV4 && bV4) return 1;
+            return a.localeCompare(b);
+        });
+        
+        if (uniqueIPs.length === 0) {
+            throw new Error('未获取到任何 IP');
+        }
+
+        const resultText = uniqueIPs.join('\n');
+        cache.data = resultText;
+        cache.timestamp = now;
+        
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('X-Cache', 'MISS');
+        res.setHeader('X-Cache-Expire', new Date(now + cache.ttl).toISOString());
+        return res.end(resultText);
+        
+    } catch (error) {
+        console.error('全局错误:', error.message);
+        
+        // 降级方案：即使出错也返回陈旧缓存
+        if (cache.data) {
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('X-Cache', 'HIT-FALLBACK');
+            return res.end(cache.data);
+        }
+        
+        res.status(500).end('Error: ' + error.message);
+    }
+};
+
+// 修复版网络请求：使用原生 https 完全兼容旧版 Node.js，内置重定向与超时阻断
+function safeHttpsFetch(url, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        const req = https.get(url, (response) => {
+            if (response.statusCode === 301 || response.statusCode === 302) {
+                if (!response.headers.location) return reject(new Error('Missing location'));
+                const targetUrl = new URL(response.headers.location, url).toString();
+                return safeHttpsFetch(targetUrl, timeoutMs).then(resolve).catch(reject);
+            }
+
+            if (response.statusCode !== 200) {
+                return reject(new Error(`HTTP ${response.statusCode}`));
+            }
+
+            let rawData = '';
+            response.on('data', (chunk) => rawData += chunk);
+            response.on('end', () => resolve(rawData));
+        });
+        
+        req.on('error', reject);
+        req.setTimeout(timeoutMs, () => {
+            req.destroy();
+            reject(new Error('Request timeout'));
+        });
+    });
+}
+
+// 完美融合源码中的多数据源适配与提取逻辑
+function extractIPs(data, source) {
+    let rawCandidates = [];
+    
+    if (source.includes('wetest.vip')) {
+        const tableMatches = data.match(/<td[^>]*>([0-9\.\:]+)<\/td>/g);
+        if (tableMatches) {
+            tableMatches.forEach(td => {
+                rawCandidates.push(td.replace(/<[^>]+>/g, '').trim());
+            });
+        }
+    }
+    
+    if (source.includes('ipdb.api.030101.xyz') || source.includes('stock.hostmonit.com')) {
+        try {
+            const jsonData = JSON.parse(data);
+            const list = jsonData.data || jsonData.info || [];
+            if (Array.isArray(list)) {
+                list.forEach(item => {
+                    if (item.ip && typeof item.ip === 'string') {
+                        rawCandidates.push(item.ip.trim());
+                    }
+                });
+            }
+        } catch (e) {}
+    }
+
+    // 保留源码：正则提取文本中的所有 IPv4 / IPv6 字符串
+    rawCandidates = rawCandidates.concat(matchAllIPs(data));
+
+    // 过滤并保留公网 IPv4 / IPv6 地址
+    return rawCandidates.filter(ip => isPublicIP(ip));
+}
+
+// 保留源码：双栖正则提取逻辑
+function matchAllIPs(text) {
+    const ips = [];
+    
+    const ipv4Regex = /\b(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/g;
+    const v4Matches = text.match(ipv4Regex);
+    if (v4Matches) ips.push(...v4Matches);
+
+    const ipv6Regex = /(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?:(?::[0-9a-fA-F]{1,4}){1,6})|:(?:(?::[0-9a-fA-F]{1,4}){1,7}|:))/g;
+    const v6Matches = text.match(ipv6Regex);
+    if (v6Matches) ips.push(...v6Matches);
+
+    return ips;
+}
+
+// 保留源码：严格检查是否为有效公网 IP
+function isPublicIP(ip) {
+    const ipType = net.isIP(ip);
+
+    if (ipType === 4) {
+        const parts = ip.split('.').map(Number);
+        if (parts[0] === 0 || parts[0] === 10 || parts[0] === 127) return false;
+        if (parts[0] === 169 && parts[1] === 254) return false;
+        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;
+        if (parts[0] === 192 && parts[1] === 168) return false;
+        return true;
+    }
+
+    if (ipType === 6) {
+        const lower = ip.toLowerCase();
+        if (lower === '::' || lower === '::1') return false;
+        if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) return false;
+        if (lower.startsWith('fc') || lower.startsWith('fd')) return false;
+        return true;
+    }
+
+    return false;
+}
 
         // 【核心修改方案注入】：将容易超时的串行 for 循环改为并发请求 + 硬超时控制
         const fetchPromises = dataSources.map(source => safeFetch(source, 4000));
