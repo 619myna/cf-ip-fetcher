@@ -1,1 +1,5 @@
-{ "name": "vercel-ip", "version": "1.0.0", "engines": { "node": "18.x" } }
+{
+  "name": "ip-fetcher",
+  "version": "1.0.0",
+  "engines": { "node": "24.x" }
+}
