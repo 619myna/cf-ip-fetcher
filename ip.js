@@ -1,20 +1,20 @@
 const https = require('https');
 const net = require('net');
 
-// 全局内存缓存变量[span_1](start_span)[span_1](end_span)
+// 全局内存缓存
 let cache = {
     data: null,
     timestamp: 0,
-    ttl: 60000 // 1分钟缓存，单位毫秒[span_2](start_span)[span_2](end_span)
+    ttl: 60000 // 1分钟缓存，单位毫秒
 };
 
 module.exports = async (req, res) => {
     try {
         const now = Date.now();
 
-        // 1. 检查缓存是否有效（命中缓存直接返回）[span_3](start_span)[span_3](end_span)
+        // 1. 优先检查缓存
         if (cache.data && (now - cache.timestamp) < cache.ttl) {
-            console.log('返回缓存数据');[span_4](start_span)[span_4](end_span)
+            console.log('返回缓存数据');
             res.setHeader('Content-Type', 'text/plain; charset=utf-8');
             res.setHeader('Access-Control-Allow-Origin', '*');
             res.setHeader('X-Cache', 'HIT');
@@ -22,7 +22,7 @@ module.exports = async (req, res) => {
             return res.end(cache.data);
         }
 
-        // 2. 完整数据源列表（包含 IPv4 和 IPv6 链接）[span_5](start_span)[span_5](end_span)
+        // 数据源列表
         const dataSources = [
             'https://ipdb.api.030101.xyz/?type=bestcf',
             'https://ip.164746.xyz/ipTop.html', 
@@ -33,7 +33,199 @@ module.exports = async (req, res) => {
             'https://api.urlce.com/cloudflare.html'
         ];
 
-        // 3. 并发请求所有数据源，设置 3.5 秒硬超时阻断，防 Vercel 10 秒超时崩溃[span_6](start_span)[span_6](end_span)
+        // 2. 并发请求，硬超时 3.5 秒阻断，防止打爆 Vercel 10s 限制
+        const fetchPromises = dataSources.map(source => 
+            safeFetch(source, 3500)
+                .then(data => ({ source, data }))
+                .catch(() => ({ source, data: null }))
+        );
+
+        const results = await Promise.all(fetchPromises);
+        let allIPs = [];
+
+        results.forEach(result => {
+            if (result.data) {
+                const ips = extractIPs(result.data, result.source);
+                allIPs.push(...ips);
+                console.log(`从 ${result.source} 提取到 ${ips.length} 个有效 IP`);
+            } else {
+                console.log(`获取 ${result.source} 失败或超时`);
+            }
+        });
+
+        // 3. 去重与双栈排序（IPv4 排前，IPv6 排后，字典序）
+        const uniqueIPs = Array.from(new Set(allIPs)).sort((a, b) => {
+            const aV4 = a.includes(".");
+            const bV4 = b.includes(".");
+            if (aV4 && !bV4) return -1;
+            if (!aV4 && bV4) return 1;
+            return a.localeCompare(b);
+        });
+        
+        if (uniqueIPs.length === 0) {
+            throw new Error('未获取到任何有效 IP');
+        }
+
+        const resultText = uniqueIPs.join('\n');
+        
+        // 更新缓存
+        cache.data = resultText;
+        cache.timestamp = now;
+        
+        console.log(`获取完成，共 ${uniqueIPs.length} 个唯一IP，缓存已更新`);
+
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('X-Cache', 'MISS');
+        res.setHeader('X-Cache-Expire', new Date(now + cache.ttl).toISOString());
+        return res.end(resultText);
+        
+    } catch (error) {
+        console.error('全局错误:', error.message || error);
+        
+        // 4. 降级方案：有旧缓存则返回旧缓存
+        if (cache.data) {
+            console.log('发生错误，返回缓存数据作为降级方案');
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('X-Cache', 'HIT-FALLBACK');
+            res.setHeader('X-Cache-Expire', new Date(cache.timestamp + cache.ttl).toISOString());
+            return res.end(cache.data);
+        }
+        
+        // 关键修复：使用原生 Node.js HTTP 状态码赋值，彻底解决 res.status 不存在引发的云函数崩溃
+        res.statusCode = 500;
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        return res.end('Error: ' + (error.message || 'Internal Server Error'));
+    }
+};
+
+/**
+ * 高兼容性 Fetch 请求函数（带超时中止控制）
+ */
+async function safeFetch(url, timeoutMs = 3500) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+        const response = await fetch(url, {
+            signal: controller.signal,
+            headers: { 'User-Agent': 'Mozilla/5.0 (Vercel Serverless Agent)' }
+        });
+        clearTimeout(timer);
+        if (!response.ok) return null;
+        return await response.text();
+    } catch (e) {
+        clearTimeout(timer);
+        return null;
+    }
+}
+
+/**
+ * 高性能零 ReDoS 提取函数（支持特征筛查，防 CPU / 内存超限）
+ */
+function extractIPs(data, source) {
+    if (!data || typeof data !== 'string') return [];
+    
+    let rawCandidates = [];
+    
+    // 1. JSON 数据源快速结构化提取
+    if (source && (source.includes('ipdb.api.030101.xyz') || source.includes('stock.hostmonit.com'))) {
+        try {
+            const jsonData = JSON.parse(data);
+            const list = jsonData.data || jsonData.info || [];
+            if (Array.isArray(list)) {
+                list.forEach(item => {
+                    if (item && typeof item.ip === 'string') {
+                        rawCandidates.push(item.ip.trim());
+                    }
+                });
+            }
+        } catch (e) {}
+    }
+
+    // 2. HTML 表格特征抽取 (wetest.vip)
+    if (source && source.includes('wetest.vip')) {
+        const tdMatches = data.match(/<td[^>]*>([\s\S]*?)<\/td>/gi);
+        if (tdMatches) {
+            tdMatches.forEach(td => {
+                const text = td.replace(/<[^>]+>/g, '').trim();
+                if (text.includes('.') || text.includes(':')) {
+                    rawCandidates.push(text);
+                }
+            });
+        }
+    }
+
+    // 3. 安全高效分词：过滤无效词组（仅处理包含 '.' 或 ':' 且长度在 2-39 的字符串，避开数十万无效 HTML 标签）
+    const tokens = data.split(/[^0-9a-fA-F.:]+/);
+    for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
+        if (token.length >= 2 && token.length <= 39 && (token.includes('.') || token.includes(':'))) {
+            const cleaned = token.replace(/^[.:]+|[.:]+$/g, '');
+            if (cleaned.length >= 2) {
+                rawCandidates.push(cleaned);
+            }
+        }
+    }
+
+    // 4. Node 原生 C++ 底层 isIP 校验与私有地址过滤
+    return rawCandidates.filter(ip => isPublicIP(ip));
+}
+
+/**
+ * 检查是否为有效公网 IP (Node.js net.isIP)
+ */
+function isPublicIP(ip) {
+    const ipType = net.isIP(ip);
+
+    if (ipType === 4) {
+        const parts = ip.split('.').map(Number);
+        if (parts[0] === 0 || parts[0] === 10 || parts[0] === 127) return false;
+        if (parts[0] === 169 && parts[1] === 254) return false;
+        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;
+        if (parts[0] === 192 && parts[1] === 168) return false;
+        return true;
+    }
+
+    if (ipType === 6) {
+        const lower = ip.toLowerCase();
+        if (lower === '::' || lower === '::1') return false;
+        if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) return false;
+        if (lower.startsWith('fc') || lower.startsWith('fd')) return false;
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * 完整保留源码备用 fetchData 函数
+ */
+function fetchData(url) {
+    return new Promise((resolve, reject) => {
+        const req = https.get(url, (response) => {
+            if (response.statusCode === 301 || response.statusCode === 302) {
+                const redirectUrl = response.headers.location;
+                return fetchData(redirectUrl).then(resolve).catch(reject);
+            }
+
+            if (response.statusCode !== 200) {
+                reject(new Error(`HTTP ${response.statusCode}`));
+                return;
+            }
+
+            let rawData = '';
+            response.on('data', (chunk) => rawData += chunk);
+            response.on('end', () => resolve(rawData));
+        }).on('error', reject);
+        
+        req.setTimeout(10000, () => {
+            req.destroy();
+            reject(new Error('Request timeout'));
+        });
+    });
+}
         const fetchPromises = dataSources.map(source => 
             safeFetch(source, 3500)
                 .then(data => ({ source, data }))
