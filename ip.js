@@ -1,19 +1,20 @@
 const https = require('https');
 const net = require('net');
 
-// 缓存变量
+// 全局内存缓存变量[span_1](start_span)[span_1](end_span)
 let cache = {
     data: null,
     timestamp: 0,
-    ttl: 60000 // 1分钟缓存，单位毫秒
+    ttl: 60000 // 1分钟缓存，单位毫秒[span_2](start_span)[span_2](end_span)
 };
 
 module.exports = async (req, res) => {
     try {
-        // 检查缓存是否有效
         const now = Date.now();
+
+        // 1. 检查缓存是否有效（命中缓存直接返回）[span_3](start_span)[span_3](end_span)
         if (cache.data && (now - cache.timestamp) < cache.ttl) {
-            console.log('返回缓存数据');
+            console.log('返回缓存数据');[span_4](start_span)[span_4](end_span)
             res.setHeader('Content-Type', 'text/plain; charset=utf-8');
             res.setHeader('Access-Control-Allow-Origin', '*');
             res.setHeader('X-Cache', 'HIT');
@@ -21,7 +22,7 @@ module.exports = async (req, res) => {
             return res.end(cache.data);
         }
 
-        // 整合并解开注释源码中的所有数据源（包含 IPv4 和 IPv6 链接）
+        // 2. 完整数据源列表（包含 IPv4 和 IPv6 链接）[span_5](start_span)[span_5](end_span)
         const dataSources = [
             'https://ipdb.api.030101.xyz/?type=bestcf',
             'https://ip.164746.xyz/ipTop.html', 
@@ -32,11 +33,11 @@ module.exports = async (req, res) => {
             'https://api.urlce.com/cloudflare.html'
         ];
 
-        // 核心修复：并发请求并设置 3.5 秒绝对硬超时，防 Vercel 10s 死线崩溃
+        // 3. 并发请求所有数据源，设置 3.5 秒硬超时阻断，防 Vercel 10 秒超时崩溃[span_6](start_span)[span_6](end_span)
         const fetchPromises = dataSources.map(source => 
-            safeHttpsFetch(source, 3500)
+            safeFetch(source, 3500)
                 .then(data => ({ source, data }))
-                .catch(() => ({ source, data: null })) // 失败静默拦截，不影响全局
+                .catch(() => ({ source, data: null })) // 失败静默拦截，不影响全局[span_7](start_span)[span_7](end_span)
         );
 
         const results = await Promise.all(fetchPromises);
@@ -46,11 +47,13 @@ module.exports = async (req, res) => {
             if (result.data) {
                 const ips = extractIPs(result.data, result.source);
                 allIPs = allIPs.concat(ips);
-                console.log(`从 ${result.source} 提取到有效 IP`);
+                console.log(`从 ${result.source} 提取到 ${ips.length} 个有效 IP`);
+            } else {
+                console.log(`获取 ${result.source} 失败或超时`);[span_8](start_span)[span_8](end_span)
             }
         });
 
-        // 融合源码的去重与排序逻辑（IPv4排前，IPv6排后，按字母序）
+        // 4. 去重与排序逻辑（IPv4 排前，IPv6 排后，内部按字母字典序）[span_9](start_span)[span_9](end_span)
         const uniqueIPs = [...new Set(allIPs)].sort((a, b) => {
             const aV4 = a.includes(".");
             const bV4 = b.includes(".");
@@ -60,13 +63,18 @@ module.exports = async (req, res) => {
         });
         
         if (uniqueIPs.length === 0) {
-            throw new Error('未获取到任何 IP');
+            throw new Error('未获取到任何 IP');[span_10](start_span)[span_10](end_span)
         }
 
         const resultText = uniqueIPs.join('\n');
+        
+        // 更新缓存[span_11](start_span)[span_11](end_span)
         cache.data = resultText;
         cache.timestamp = now;
         
+        console.log(`获取完成，共 ${uniqueIPs.length} 个唯一IP，缓存已更新`);[span_12](start_span)[span_12](end_span)
+
+        // 设置响应头并返回数据[span_13](start_span)[span_13](end_span)
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('X-Cache', 'MISS');
@@ -74,169 +82,11 @@ module.exports = async (req, res) => {
         return res.end(resultText);
         
     } catch (error) {
-        console.error('全局错误:', error.message);
+        console.error('全局错误:', error.message || error);[span_14](start_span)[span_14](end_span)
         
-        // 降级方案：即使出错也返回陈旧缓存
+        // 5. 降级方案：若发生错误且存有旧缓存，返回过期的缓存[span_15](start_span)[span_15](end_span)
         if (cache.data) {
-            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.setHeader('X-Cache', 'HIT-FALLBACK');
-            return res.end(cache.data);
-        }
-        
-        res.status(500).end('Error: ' + error.message);
-    }
-};
-
-// 修复版网络请求：使用原生 https 完全兼容旧版 Node.js，内置重定向与超时阻断
-function safeHttpsFetch(url, timeoutMs) {
-    return new Promise((resolve, reject) => {
-        const req = https.get(url, (response) => {
-            if (response.statusCode === 301 || response.statusCode === 302) {
-                if (!response.headers.location) return reject(new Error('Missing location'));
-                const targetUrl = new URL(response.headers.location, url).toString();
-                return safeHttpsFetch(targetUrl, timeoutMs).then(resolve).catch(reject);
-            }
-
-            if (response.statusCode !== 200) {
-                return reject(new Error(`HTTP ${response.statusCode}`));
-            }
-
-            let rawData = '';
-            response.on('data', (chunk) => rawData += chunk);
-            response.on('end', () => resolve(rawData));
-        });
-        
-        req.on('error', reject);
-        req.setTimeout(timeoutMs, () => {
-            req.destroy();
-            reject(new Error('Request timeout'));
-        });
-    });
-}
-
-// 完美融合源码中的多数据源适配与提取逻辑
-function extractIPs(data, source) {
-    let rawCandidates = [];
-    
-    if (source.includes('wetest.vip')) {
-        const tableMatches = data.match(/<td[^>]*>([0-9\.\:]+)<\/td>/g);
-        if (tableMatches) {
-            tableMatches.forEach(td => {
-                rawCandidates.push(td.replace(/<[^>]+>/g, '').trim());
-            });
-        }
-    }
-    
-    if (source.includes('ipdb.api.030101.xyz') || source.includes('stock.hostmonit.com')) {
-        try {
-            const jsonData = JSON.parse(data);
-            const list = jsonData.data || jsonData.info || [];
-            if (Array.isArray(list)) {
-                list.forEach(item => {
-                    if (item.ip && typeof item.ip === 'string') {
-                        rawCandidates.push(item.ip.trim());
-                    }
-                });
-            }
-        } catch (e) {}
-    }
-
-    // 保留源码：正则提取文本中的所有 IPv4 / IPv6 字符串
-    rawCandidates = rawCandidates.concat(matchAllIPs(data));
-
-    // 过滤并保留公网 IPv4 / IPv6 地址
-    return rawCandidates.filter(ip => isPublicIP(ip));
-}
-
-// 保留源码：双栖正则提取逻辑
-function matchAllIPs(text) {
-    const ips = [];
-    
-    const ipv4Regex = /\b(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/g;
-    const v4Matches = text.match(ipv4Regex);
-    if (v4Matches) ips.push(...v4Matches);
-
-    const ipv6Regex = /(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?:(?::[0-9a-fA-F]{1,4}){1,6})|:(?:(?::[0-9a-fA-F]{1,4}){1,7}|:))/g;
-    const v6Matches = text.match(ipv6Regex);
-    if (v6Matches) ips.push(...v6Matches);
-
-    return ips;
-}
-
-// 保留源码：严格检查是否为有效公网 IP
-function isPublicIP(ip) {
-    const ipType = net.isIP(ip);
-
-    if (ipType === 4) {
-        const parts = ip.split('.').map(Number);
-        if (parts[0] === 0 || parts[0] === 10 || parts[0] === 127) return false;
-        if (parts[0] === 169 && parts[1] === 254) return false;
-        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;
-        if (parts[0] === 192 && parts[1] === 168) return false;
-        return true;
-    }
-
-    if (ipType === 6) {
-        const lower = ip.toLowerCase();
-        if (lower === '::' || lower === '::1') return false;
-        if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) return false;
-        if (lower.startsWith('fc') || lower.startsWith('fd')) return false;
-        return true;
-    }
-
-    return false;
-}
-
-        // 【核心修改方案注入】：将容易超时的串行 for 循环改为并发请求 + 硬超时控制
-        const fetchPromises = dataSources.map(source => safeFetch(source, 4000));
-        const results = await Promise.allSettled(fetchPromises);
-
-        let allIPs = [];
-        results.forEach((result, index) => {
-            if (result.status === 'fulfilled' && result.value) {
-                const source = dataSources[index];
-                const ips = extractIPs(result.value, source);
-                allIPs = allIPs.concat(ips);
-                console.log(`从 ${source} 获取到 ${ips.length} 个有效IP`);
-            } else {
-                console.log(`获取 ${dataSources[index]} 失败或超时`);
-            }
-        });
-
-        // 融合源码底部的去重与排序逻辑（IPv4排前，IPv6排后，按字母序）
-        const uniqueIPs = [...new Set(allIPs)].sort((a, b) => {
-            const aV4 = a.includes(".");
-            const bV4 = b.includes(".");
-            if (aV4 && !bV4) return -1;
-            if (!aV4 && bV4) return 1;
-            return a.localeCompare(b);
-        });
-        
-        // 格式化为文本
-        const resultText = uniqueIPs.join('\n');
-        
-        // 更新缓存
-        cache.data = resultText;
-        cache.timestamp = now;
-        
-        console.log(`获取完成，共 ${uniqueIPs.length} 个唯一IP，缓存已更新`);
-
-        // 设置响应头
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('X-Cache', 'MISS');
-        res.setHeader('X-Cache-Expire', new Date(now + cache.ttl).toISOString());
-        
-        // 返回IP列表
-        res.end(resultText);
-        
-    } catch (error) {
-        console.error('全局错误:', error);
-        
-        // 如果缓存有数据，即使出错也返回缓存数据
-        if (cache.data) {
-            console.log('发生错误，返回缓存数据作为降级方案');
+            console.log('发生错误，返回缓存数据作为降级方案');[span_16](start_span)[span_16](end_span)
             res.setHeader('Content-Type', 'text/plain; charset=utf-8');
             res.setHeader('Access-Control-Allow-Origin', '*');
             res.setHeader('X-Cache', 'HIT-FALLBACK');
@@ -244,30 +94,36 @@ function isPublicIP(ip) {
             return res.end(cache.data);
         }
         
-        res.status(500).end('Error: ' + error.message);
+        res.status(500).end('Error: ' + error.message);[span_17](start_span)[span_17](end_span)
     }
 };
 
-// 【修改方案引入的函数】：安全并发请求函数，解决 Vercel 10秒崩溃问题
-async function safeFetch(url, timeoutMs) {
+/**
+ * 高效安全 Fetch 请求，支持强制超时中止[span_18](start_span)[span_18](end_span)
+ */
+async function safeFetch(url, timeoutMs = 3500) {
     try {
         const response = await fetch(url, {
             signal: AbortSignal.timeout(timeoutMs),
-            headers: { 'User-Agent': 'Mozilla/5.0 (Vercel Serverless)' }
+            headers: { 'User-Agent': 'Mozilla/5.0 (Vercel Serverless Agent)' }
         });
         if (!response.ok) return null;
         return await response.text();
     } catch (e) {
-        return null; // 超时或失败静默返回null，不影响整体进程
+        return null; // 超时或失败静默返回 null，不阻塞主流程[span_19](start_span)[span_19](end_span)
     }
 }
 
-// 完美融合源码中的多数据源适配与提取逻辑
+/**
+ * IP 提取逻辑：融合 JSON 结构解析、表格抽取与 O(N) 分词提取，彻底根除 ReDoS 正则灾难性回溯漏洞[span_20](start_span)[span_20](end_span)
+ */
 function extractIPs(data, source) {
+    if (!data || typeof data !== 'string') return [];
+    
     let rawCandidates = [];
     
-    // 适配 wetest HTML表格处理
-    if (source.includes('wetest.vip')) {
+    // 1. 特殊适配 wetest HTML 表格处理[span_21](start_span)[span_21](end_span)
+    if (source && source.includes('wetest.vip')) {
         const tableMatches = data.match(/<td[^>]*>([0-9\.\:]+)<\/td>/g);
         if (tableMatches) {
             tableMatches.forEach(td => {
@@ -276,8 +132,8 @@ function extractIPs(data, source) {
         }
     }
     
-    // 尝试 JSON 格式提取
-    if (source.includes('ipdb.api.030101.xyz') || source.includes('stock.hostmonit.com')) {
+    // 2. 特殊适配 JSON 接口提取[span_22](start_span)[span_22](end_span)
+    if (source && (source.includes('ipdb.api.030101.xyz') || source.includes('stock.hostmonit.com'))) {
         try {
             const jsonData = JSON.parse(data);
             const list = jsonData.data || jsonData.info || [];
@@ -289,75 +145,60 @@ function extractIPs(data, source) {
                 });
             }
         } catch (e) {
-            // JSON 解析失败则静默
+            // JSON 解析失败则静默回退到通用分词提取[span_23](start_span)[span_23](end_span)
         }
     }
 
-    // 结构化提取失败或为空，则通过源码高级正则提取全文本候选 IP
-    if (rawCandidates.length === 0) {
-        rawCandidates = matchAllIPs(data);
-    } else {
-        // 合并正则提取防止遗漏
-        rawCandidates = rawCandidates.concat(matchAllIPs(data));
+    // 3. 核心零 ReDoS 优化：按非 IP 字符切分为词组，严格线性 O(N) 扫描，绝无长文本耗尽 CPU 风险[span_24](start_span)[span_24](end_span)
+    const tokens = data.split(/[^0-9a-fA-F.:]+/);
+    for (let token of tokens) {
+        const cleaned = token.replace(/^[.:]+|[.:]+$/g, '');
+        if (cleaned) {
+            rawCandidates.push(cleaned);
+        }
     }
 
-    // 过滤并保留公网 IPv4 / IPv6 地址
+    // 4. 过滤并保留公网 IPv4 / IPv6 地址（底层使用 net.isIP 校验）[span_25](start_span)[span_25](end_span)
     return rawCandidates.filter(ip => isPublicIP(ip));
 }
 
-// 保留源码：正则提取文本中的所有 IPv4 / IPv6 字符串
-function matchAllIPs(text) {
-    const ips = [];
-    
-    // IPv4 严谨正则
-    const ipv4Regex = /\b(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/g;
-    const v4Matches = text.match(ipv4Regex);
-    if (v4Matches) ips.push(...v4Matches);
-
-    // IPv6 正则（匹配全写与压缩简写形式）
-    const ipv6Regex = /(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?:(?::[0-9a-fA-F]{1,4}){1,6})|:(?:(?::[0-9a-fA-F]{1,4}){1,7}|:))/g;
-    const v6Matches = text.match(ipv6Regex);
-    if (v6Matches) ips.push(...v6Matches);
-
-    return ips;
-}
-
-// 保留源码：检查是否为有效公网 IP (包含 IPv4 与 IPv6)
+/**
+ * 校验公网 IP (兼容 IPv4 与 IPv6，使用 Node.js 底层 net.isIP)[span_26](start_span)[span_26](end_span)
+ */
 function isPublicIP(ip) {
-    const ipType = net.isIP(ip);
+    const ipType = net.isIP(ip); // 返回 4、6 或 0[span_27](start_span)[span_27](end_span)
 
-    // IPv4 公网判断
+    // IPv4 公网判断[span_28](start_span)[span_28](end_span)
     if (ipType === 4) {
         const parts = ip.split('.').map(Number);
-        if (parts[0] === 0) return false;
-        if (parts[0] === 10) return false;
-        if (parts[0] === 127) return false;
-        if (parts[0] === 169 && parts[1] === 254) return false;
-        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;
-        if (parts[0] === 192 && parts[1] === 168) return false;
+        if (parts[0] === 0 || parts[0] === 10 || parts[0] === 127) return false;[span_29](start_span)[span_29](end_span)
+        if (parts[0] === 169 && parts[1] === 254) return false;[span_30](start_span)[span_30](end_span)
+        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;[span_31](start_span)[span_31](end_span)
+        if (parts[0] === 192 && parts[1] === 168) return false;[span_32](start_span)[span_32](end_span)
         return true;
     }
 
-    // IPv6 公网判断
+    // IPv6 公网判断[span_33](start_span)[span_33](end_span)
     if (ipType === 6) {
         const lower = ip.toLowerCase();
-        // 排除环回与未指定地址 (::, ::1)
-        if (lower === '::' || lower === '::1') return false;
-        // 排除链路本地地址 (fe80::/10)
-        if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) return false;
-        // 排除唯一本地私网地址 (fc00::/7)
-        if (lower.startsWith('fc') || lower.startsWith('fd')) return false;
+        // 排除环回与未指定地址 (::, ::1)[span_34](start_span)[span_34](end_span)
+        if (lower === '::' || lower === '::1') return false;[span_35](start_span)[span_35](end_span)
+        // 排除链路本地地址 (fe80::/10)[span_36](start_span)[span_36](end_span)
+        if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) return false;[span_37](start_span)[span_37](end_span)
+        // 排除唯一本地私网地址 (fc00::/7)[span_38](start_span)[span_38](end_span)
+        if (lower.startsWith('fc') || lower.startsWith('fd')) return false;[span_39](start_span)[span_39](end_span)
         return true;
     }
 
     return false;
 }
 
-// 【遵循要求不得删简】: 完整保留废弃的老版 fetchData 备用方法
+/**
+ * 保留源码备用 fetchData 函数（兼容旧版原生 https 请求）[span_40](start_span)[span_40](end_span)
+ */
 function fetchData(url) {
     return new Promise((resolve, reject) => {
         const req = https.get(url, (response) => {
-            // 处理重定向
             if (response.statusCode === 301 || response.statusCode === 302) {
                 const redirectUrl = response.headers.location;
                 return fetchData(redirectUrl).then(resolve).catch(reject);
@@ -373,947 +214,9 @@ function fetchData(url) {
             response.on('end', () => resolve(rawData));
         }).on('error', reject);
         
-        // 设置超时（10秒）
         req.setTimeout(10000, () => {
             req.destroy();
             reject(new Error('Request timeout'));
         });
     });
-}
-        let allIPs = [];
-
-        // 依次获取每个数据源
-        for (const source of dataSources) {
-            try {
-                console.log(`正在获取: ${source}`);
-                const data = await fetchData(source);
-                const ips = extractIPs(data, source);
-                allIPs = allIPs.concat(ips);
-                console.log(`从 ${source} 获取到 ${ips.length} 个IP`);
-            } catch (error) {
-                console.log(`获取 ${source} 失败: ${error.message}`);
-                // 继续尝试下一个数据源
-                continue;
-            }
-        }
-
-        // 去重并排序
-        const uniqueIPs = [...new Set(allIPs)].sort();
-        
-        // 格式化为文本
-        const resultText = uniqueIPs.join('\n');
-        
-        // 更新缓存
-        cache.data = resultText;
-        cache.timestamp = now;
-        
-        console.log(`获取完成，共 ${uniqueIPs.length} 个唯一IP，缓存已更新`);
-
-        // 设置响应头
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('X-Cache', 'MISS');
-        res.setHeader('X-Cache-Expire', new Date(now + cache.ttl).toISOString());
-        
-        // 返回IP列表
-        res.end(resultText);
-        
-    } catch (error) {
-        console.error('全局错误:', error);
-        
-        // 如果缓存有数据，即使出错也返回缓存数据
-        if (cache.data) {
-            console.log('发生错误，返回缓存数据作为降级方案');
-            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.setHeader('X-Cache', 'HIT-FALLBACK');
-            res.setHeader('X-Cache-Expire', new Date(cache.timestamp + cache.ttl).toISOString());
-            return res.end(cache.data);
-        }
-        
-        res.status(500).end('Error: ' + error.message);
-    }
-};
-
-// 获取数据函数
-function fetchData(url) {
-    return new Promise((resolve, reject) => {
-        const req = https.get(url, (response) => {
-            // 处理重定向
-            if (response.statusCode === 301 || response.statusCode === 302) {
-                const redirectUrl = response.headers.location;
-                return fetchData(redirectUrl).then(resolve).catch(reject);
-            }
-
-            if (response.statusCode !== 200) {
-                reject(new Error(`HTTP ${response.statusCode}`));
-                return;
-            }
-
-            let rawData = '';
-            response.on('data', (chunk) => rawData += chunk);
-            response.on('end', () => resolve(rawData));
-        }).on('error', reject);
-        
-        // 设置超时（10秒）
-        req.setTimeout(10000, () => {
-            req.destroy();
-            reject(new Error('Request timeout'));
-        });
-    });
-}
-
-// 从不同数据源提取IP地址
-function extractIPs(data, source) {
-    const ips = [];
-    
-    // IP地址正则表达式（匹配IPv4）
-    const ipRegex = /\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g;
-    
-    // 根据数据源进行不同的处理
-    if (source.includes('ipdb.api.030101.xyz')) {
-        // JSON格式处理
-        try {
-            const jsonData = JSON.parse(data);
-            if (jsonData && Array.isArray(jsonData.data)) {
-                jsonData.data.forEach(item => {
-                    if (item.ip && typeof item.ip === 'string') {
-                        const match = item.ip.match(ipRegex);
-                        if (match) ips.push(...match);
-                    }
-                });
-            }
-        } catch (e) {
-            // 如果JSON解析失败，回退到文本提取
-            const matches = data.match(ipRegex);
-            if (matches) ips.push(...matches);
-        }
-    }
-    else if (source.includes('stock.hostmonit.com')) {
-        // JSON格式处理
-        try {
-            const jsonData = JSON.parse(data);
-            if (jsonData && Array.isArray(jsonData.info)) {
-                jsonData.info.forEach(item => {
-                    if (item.ip && typeof item.ip === 'string') {
-                        const match = item.ip.match(ipRegex);
-                        if (match) ips.push(...match);
-                    }
-                });
-            }
-        } catch (e) {
-            const matches = data.match(ipRegex);
-            if (matches) ips.push(...matches);
-        }
-    }
-    else if (source.includes('wetest.vip')) {
-        // HTML表格处理
-        const tableMatches = data.match(/<td[^>]*>(\d+\.\d+\.\d+\.\d+)<\/td>/g);
-        if (tableMatches) {
-            tableMatches.forEach(td => {
-                const ipMatch = td.match(ipRegex);
-                if (ipMatch) ips.push(...ipMatch);
-            });
-        } else {
-            // 回退到通用IP提取
-            const matches = data.match(ipRegex);
-            if (matches) ips.push(...matches);
-        }
-    }
-    else {
-        // 通用处理：提取所有IP地址
-        const matches = data.match(ipRegex);
-        if (matches) ips.push(...matches);
-    }
-    
-    // 过滤有效的IP地址（排除本地和私有IP）
-    return ips.filter(ip => {
-        const parts = ip.split('.');
-        // 排除 0.x.x.x, 10.x.x.x, 127.x.x.x, 169.254.x.x, 172.16.x.x-172.31.x.x, 192.168.x.x
-        if (parts[0] === '0') return false;
-        if (parts[0] === '10') return false;
-        if (parts[0] === '127') return false;
-        if (parts[0] === '169' && parts[1] === '254') return false;
-        if (parts[0] === '172' && parseInt(parts[1]) >= 16 && parseInt(parts[1]) <= 31) return false;
-        if (parts[0] === '192' && parts[1] === '168') return false;
-        return true;
-    });
-            }
-
-        let allIPs = [];
-
-        // 依次获取每个数据源
-        for (const source of dataSources) {
-            try {
-                console.log(`正在获取: ${source}`);
-                const data = await fetchData(source);
-                const ips = extractIPs(data, source);
-                allIPs = allIPs.concat(ips);
-                console.log(`从 ${source} 获取到 ${ips.length} 个IP`);
-            } catch (error) {
-                console.log(`获取 ${source} 失败: ${error.message}`);
-                // 继续尝试下一个数据源
-                continue;
-            }
-        }
-
-        // 去重并排序
-        const uniqueIPs = [...new Set(allIPs)].sort();
-        
-        // 格式化为文本
-        const resultText = uniqueIPs.join('\n');
-        
-        // 更新缓存
-        cache.data = resultText;
-        cache.timestamp = now;
-        
-        console.log(`获取完成，共 ${uniqueIPs.length} 个唯一IP，缓存已更新`);
-
-        // 设置响应头
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('X-Cache', 'MISS');
-        res.setHeader('X-Cache-Expire', new Date(now + cache.ttl).toISOString());
-        
-        // 返回IP列表
-        res.end(resultText);
-        
-    } catch (error) {
-        console.error('全局错误:', error);
-        
-        // 如果缓存有数据，即使出错也返回缓存数据
-        if (cache.data) {
-            console.log('发生错误，返回缓存数据作为降级方案');
-            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.setHeader('X-Cache', 'HIT-FALLBACK');
-            res.setHeader('X-Cache-Expire', new Date(cache.timestamp + cache.ttl).toISOString());
-            return res.end(cache.data);
-        }
-        
-        res.status(500).end('Error: ' + error.message);
-    }
-};
-
-// 获取数据函数
-function fetchData(url) {
-    return new Promise((resolve, reject) => {
-        const req = https.get(url, (response) => {
-            // 处理重定向
-            if (response.statusCode === 301 || response.statusCode === 302) {
-                const redirectUrl = response.headers.location;
-                return fetchData(redirectUrl).then(resolve).catch(reject);
-            }
-
-            if (response.statusCode !== 200) {
-                reject(new Error(`HTTP ${response.statusCode}`));
-                return;
-            }
-
-            let rawData = '';
-            response.on('data', (chunk) => rawData += chunk);
-            response.on('end', () => resolve(rawData));
-        }).on('error', reject);
-        
-        // 设置超时（10秒）
-        req.setTimeout(10000, () => {
-            req.destroy();
-            reject(new Error('Request timeout'));
-        });
-    });
-}
-
-// 从不同数据源提取 IPv4 与 IPv6 地址
-function extractIPs(data, source) {
-    let rawCandidates = [];
-    
-    // 1. 尝试 JSON 格式提取
-    if (source.includes('ipdb.api.030101.xyz') || source.includes('stock.hostmonit.com')) {
-        try {
-            const jsonData = JSON.parse(data);
-            const list = jsonData.data || jsonData.info || [];
-            if (Array.isArray(list)) {
-                list.forEach(item => {
-                    if (item.ip && typeof item.ip === 'string') {
-                        rawCandidates.push(item.ip.trim());
-                    }
-                });
-            }
-        } catch (e) {
-            // JSON 解析失败则回退到全局正则匹配
-        }
-    }
-
-    // 2. 如果未从 JSON 结构化提取出数据，则通过正则提取全文本中的候选 IP
-    if (rawCandidates.length === 0) {
-        rawCandidates = matchAllIPs(data);
-    }
-
-    // 3. 过滤并保留公网 IPv4 / IPv6 地址
-    return rawCandidates.filter(ip => isPublicIP(ip));
-}
-
-// 正则提取文本中的所有 IPv4 / IPv6 字符串
-function matchAllIPs(text) {
-    const ips = [];
-    
-    // IPv4 正则
-    const ipv4Regex = /\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g;
-    const v4Matches = text.match(ipv4Regex);
-    if (v4Matches) ips.push(...v4Matches);
-
-    // IPv6 正则（匹配全写与压缩简写形式）
-    const ipv6Regex = /(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(?:(?::[0-9a-fA-F]{1,4}){1,6})|:(?:(?::[0-9a-fA-F]{1,4}){1,7}|:))/g;
-    const v6Matches = text.match(ipv6Regex);
-    if (v6Matches) ips.push(...v6Matches);
-
-    return ips;
-}
-
-// 检查是否为有效公网 IP (包含 IPv4 与 IPv6)
-function isPublicIP(ip) {
-    const ipType = net.isIP(ip);
-
-    // IPv4 公网判断
-    if (ipType === 4) {
-        const parts = ip.split('.').map(Number);
-        if (parts[0] === 0) return false;
-        if (parts[0] === 10) return false;
-        if (parts[0] === 127) return false;
-        if (parts[0] === 169 && parts[1] === 254) return false;
-        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;
-        if (parts[0] === 192 && parts[1] === 168) return false;
-        return true;
-    }
-
-    // IPv6 公网判断
-    if (ipType === 6) {
-        const lower = ip.toLowerCase();
-        // 排除环回与未指定地址 (::, ::1)
-        if (lower === '::' || lower === '::1') return false;
-        // 排除链路本地地址 (fe80::/10)
-        if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) return false;
-        // 排除唯一本地私网地址 (fc00::/7)
-        if (lower.startsWith('fc') || lower.startsWith('fd')) return false;
-        return true;
-    }
-
-    return false;
-}
-        let allIPs = [];
-        results.forEach(ips => {
-            if (Array.isArray(ips)) {
-                allIPs.push(...ips);
-            }
-        });
-
-        // 3. 去重与排序
-        const uniqueIPs = [...new Set(allIPs)].sort();
-
-        if (uniqueIPs.length > 0) {
-            const resultText = uniqueIPs.join('\n');
-            cache.data = resultText;
-            cache.timestamp = now;
-
-            res.setHeader('X-Cache', 'MISS');
-            return res.status(200).send(resultText);
-        }
-
-        // 降级策略：如果有旧缓存则返回旧缓存
-        if (cache.data) {
-            res.setHeader('X-Cache', 'HIT-FALLBACK');
-            return res.status(200).send(cache.data);
-        }
-
-        return res.status(500).send('Error: Unable to fetch IPs from any source.');
-
-    } catch (error) {
-        // 兜底防护，绝不崩溃
-        if (cache.data) {
-            return res.status(200).send(cache.data);
-        }
-        return res.status(500).send('Server Internal Error');
-    }
-}
-
-// 零崩溃安全请求函数
-async function safeFetch(url, timeoutMs) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-    try {
-        const response = await fetch(url, {
-            signal: controller.signal,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-            }
-        });
-        clearTimeout(timer);
-        if (!response.ok) return '';
-        return await response.text();
-    } catch (e) {
-        clearTimeout(timer);
-        return ''; // 遇到网络错误、超时一律返回空，不抛错
-    }
-}
-
-// 提取 IP 逻辑
-function extractIPs(data, source) {
-    if (!data) return [];
-    const ips = [];
-    const ipRegex = /\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g;
-
-    if (source.includes('ipdb.api.030101.xyz') || source.includes('stock.hostmonit.com')) {
-        try {
-            const jsonData = JSON.parse(data);
-            const list = jsonData.data || jsonData.info || [];
-            if (Array.isArray(list)) {
-                list.forEach(item => {
-                    if (item.ip && typeof item.ip === 'string') {
-                        const match = item.ip.match(ipRegex);
-                        if (match) ips.push(...match);
-                    }
-                });
-            }
-        } catch (e) {
-            const matches = data.match(ipRegex);
-            if (matches) ips.push(...matches);
-        }
-    } else {
-        const matches = data.match(ipRegex);
-        if (matches) ips.push(...matches);
-    }
-
-    return ips.filter(ip => {
-        const parts = ip.split('.').map(Number);
-        if (parts[0] === 0 || parts[0] === 10 || parts[0] === 127) return false;
-        if (parts[0] === 169 && parts[1] === 254) return false;
-        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;
-        if (parts[0] === 192 && parts[1] === 168) return false;
-        return true;
-    });
-}
-
-        let allIPs = [];
-        results.forEach((result) => {
-            if (result.status === 'fulfilled') {
-                allIPs.push(...result.value);
-            }
-        });
-
-        // 去重排序
-        const uniqueIPs = [...new Set(allIPs)].sort();
-
-        // 3. 结果处理
-        if (uniqueIPs.length > 0) {
-            const resultText = uniqueIPs.join('\n');
-            cache.data = resultText;
-            cache.timestamp = now;
-
-            res.setHeader('X-Cache', 'MISS');
-            res.setHeader('X-Cache-Expire', new Date(now + cache.ttl).toISOString());
-            return res.end(resultText);
-        }
-
-        // 如果获取失败但有旧缓存，返回降级缓存
-        if (cache.data) {
-            res.setHeader('X-Cache', 'HIT-FALLBACK');
-            return res.end(cache.data);
-        }
-
-        res.statusCode = 500;
-        res.end('Error: Failed to fetch IPs from all sources');
-
-    } catch (error) {
-        console.error('Function Error:', error.message);
-        if (cache.data) {
-            res.setHeader('X-Cache', 'HIT-FALLBACK');
-            return res.end(cache.data);
-        }
-        res.statusCode = 500;
-        res.end('Server Error: ' + error.message);
-    }
-};
-
-// 使用现代原生 fetch 请求数据
-async function fetchData(url) {
-    // 强制 2.5 秒硬超时，防止挂起 Vercel 进程
-    const response = await fetch(url, {
-        signal: AbortSignal.timeout(2500),
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-    });
-
-    if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-    }
-
-    return await response.text();
-}
-
-// 提取 IP 逻辑
-function extractIPs(data, source) {
-    const ips = [];
-    const ipRegex = /\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g;
-
-    if (source.includes('ipdb.api.030101.xyz') || source.includes('stock.hostmonit.com')) {
-        try {
-            const jsonData = JSON.parse(data);
-            const list = jsonData.data || jsonData.info || [];
-            if (Array.isArray(list)) {
-                list.forEach(item => {
-                    if (item.ip && typeof item.ip === 'string') {
-                        const match = item.ip.match(ipRegex);
-                        if (match) ips.push(...match);
-                    }
-                });
-            }
-        } catch (e) {
-            const matches = data.match(ipRegex);
-            if (matches) ips.push(...matches);
-        }
-    } else {
-        const matches = data.match(ipRegex);
-        if (matches) ips.push(...matches);
-    }
-
-    return ips.filter(ip => {
-        const parts = ip.split('.').map(Number);
-        if (parts[0] === 0 || parts[0] === 10 || parts[0] === 127) return false;
-        if (parts[0] === 169 && parts[1] === 254) return false;
-        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;
-        if (parts[0] === 192 && parts[1] === 168) return false;
-        return true;
-    });
-}
-        const results = await Promise.allSettled(
-            dataSources.map(async (source) => {
-                const data = await fetchData(source);
-                return extractIPs(data, source);
-            })
-        );
-
-        let allIPs = [];
-        results.forEach((result, index) => {
-            if (result.status === 'fulfilled') {
-                console.log(`数据源 [${dataSources[index]}] 成功获取 ${result.value.length} 个 IP`);
-                allIPs = allIPs.concat(result.value);
-            } else {
-                console.log(`数据源 [${dataSources[index]}] 失败: ${result.reason.message}`);
-            }
-        });
-
-        // 3. 去重排序
-        const uniqueIPs = [...new Set(allIPs)].sort();
-        const resultText = uniqueIPs.join('\n');
-
-        if (uniqueIPs.length > 0) {
-            // 更新缓存
-            cache.data = resultText;
-            cache.timestamp = now;
-            res.setHeader('X-Cache', 'MISS');
-            res.setHeader('X-Cache-Expire', new Date(now + cache.ttl).toISOString());
-            return res.end(resultText);
-        } else {
-            throw new Error('所有数据源均未获取到有效 IP');
-        }
-
-    } catch (error) {
-        console.error('全局错误:', error.message);
-        
-        // 降级策略：返回过期的缓存（如果有的话）
-        if (cache.data) {
-            console.log('发生错误，返回过期的缓存数据');
-            res.setHeader('X-Cache', 'HIT-FALLBACK');
-            return res.end(cache.data);
-        }
-        
-        // standard Node http response 方法
-        res.statusCode = 500;
-        res.end('Error: ' + error.message);
-    }
-};
-
-// 获取数据函数（优化了超时与重定向）
-function fetchData(url, redirectCount = 0) {
-    return new Promise((resolve, reject) => {
-        if (redirectCount > 3) {
-            return reject(new Error('重定向次数过多'));
-        }
-
-        const req = https.get(url, (response) => {
-            // 正确处理相对路径与绝对路径重定向
-            if (response.statusCode === 301 || response.statusCode === 302) {
-                const redirectLocation = response.headers.location;
-                if (!redirectLocation) return reject(new Error('301/302 未提供 Location Header'));
-                
-                // 处理相对路径重定向
-                const targetUrl = new URL(redirectLocation, url).toString();
-                return fetchData(targetUrl, redirectCount + 1).then(resolve).catch(reject);
-            }
-
-            if (response.statusCode !== 200) {
-                return reject(new Error(`HTTP ${response.statusCode}`));
-            }
-
-            let rawData = '';
-            response.on('data', (chunk) => rawData += chunk);
-            response.on('end', () => resolve(rawData));
-        }).on('error', reject);
-        
-        // 将单次请求超时缩短至 3.5 秒，避免 Vercel 10秒总限制崩溃
-        req.setTimeout(3500, () => {
-            req.destroy();
-            reject(new Error('请求超时 (3.5s)'));
-        });
-    });
-}
-
-// 提取 IP 的逻辑保持不变
-function extractIPs(data, source) {
-    const ips = [];
-    const ipRegex = /\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g;
-    
-    if (source.includes('ipdb.api.030101.xyz') || source.includes('stock.hostmonit.com')) {
-        try {
-            const jsonData = JSON.parse(data);
-            const list = jsonData.data || jsonData.info || [];
-            if (Array.isArray(list)) {
-                list.forEach(item => {
-                    if (item.ip && typeof item.ip === 'string') {
-                        const match = item.ip.match(ipRegex);
-                        if (match) ips.push(...match);
-                    }
-                });
-            }
-        } catch (e) {
-            const matches = data.match(ipRegex);
-            if (matches) ips.push(...matches);
-        }
-    } else {
-        const matches = data.match(ipRegex);
-        if (matches) ips.push(...matches);
-    }
-    
-    return ips.filter(ip => {
-        const parts = ip.split('.').map(Number);
-        if (parts[0] === 0 || parts[0] === 10 || parts[0] === 127) return false;
-        if (parts[0] === 169 && parts[1] === 254) return false;
-        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;
-        if (parts[0] === 192 && parts[1] === 168) return false;
-        return true;
-    });
-}
-        let allIPs = [];
-
-        // 依次获取每个数据源
-        for (const source of dataSources) {
-            try {
-                console.log(`正在获取: ${source}`);
-                const data = await fetchData(source);
-                const ips = extractIPs(data, source);
-                allIPs = allIPs.concat(ips);
-                console.log(`从 ${source} 获取到 ${ips.length} 个IP`);
-            } catch (error) {
-                console.log(`获取 ${source} 失败: ${error.message}`);
-                // 继续尝试下一个数据源
-                continue;
-            }
-        }
-
-        // 去重并排序
-        const uniqueIPs = [...new Set(allIPs)].sort();
-        
-        // 格式化为文本
-        const resultText = uniqueIPs.join('\n');
-        
-        // 更新缓存
-        cache.data = resultText;
-        cache.timestamp = now;
-        
-        console.log(`获取完成，共 ${uniqueIPs.length} 个唯一IP，缓存已更新`);
-
-        // 设置响应头
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('X-Cache', 'MISS');
-        res.setHeader('X-Cache-Expire', new Date(now + cache.ttl).toISOString());
-        
-        // 返回IP列表
-        res.end(resultText);
-        
-    } catch (error) {
-        console.error('全局错误:', error);
-        
-        // 如果缓存有数据，即使出错也返回缓存数据
-        if (cache.data) {
-            console.log('发生错误，返回缓存数据作为降级方案');
-            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.setHeader('X-Cache', 'HIT-FALLBACK');
-            res.setHeader('X-Cache-Expire', new Date(cache.timestamp + cache.ttl).toISOString());
-            return res.end(cache.data);
-        }
-        
-        res.status(500).end('Error: ' + error.message);
-    }
-};
-
-// 获取数据函数
-function fetchData(url) {
-    return new Promise((resolve, reject) => {
-        const req = https.get(url, (response) => {
-            // 处理重定向
-            if (response.statusCode === 301 || response.statusCode === 302) {
-                const redirectUrl = response.headers.location;
-                return fetchData(redirectUrl).then(resolve).catch(reject);
-            }
-
-            if (response.statusCode !== 200) {
-                reject(new Error(`HTTP ${response.statusCode}`));
-                return;
-            }
-
-            let rawData = '';
-            response.on('data', (chunk) => rawData += chunk);
-            response.on('end', () => resolve(rawData));
-        }).on('error', reject);
-        
-        // 设置超时（10秒）
-        req.setTimeout(10000, () => {
-            req.destroy();
-            reject(new Error('Request timeout'));
-        });
-    });
-}
-
-// 从不同数据源提取IP地址
-function extractIPs(data, source) {
-    const ips = [];
-    
-    // IP地址正则表达式（匹配IPv4）
-    const ipRegex = /\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g;
-    
-    // 根据数据源进行不同的处理
-    if (source.includes('ipdb.api.030101.xyz')) {
-        // JSON格式处理
-        try {
-            const jsonData = JSON.parse(data);
-            if (jsonData && Array.isArray(jsonData.data)) {
-                jsonData.data.forEach(item => {
-                    if (item.ip && typeof item.ip === 'string') {
-                        const match = item.ip.match(ipRegex);
-                        if (match) ips.push(...match);
-                    }
-                });
-            }
-        } catch (e) {
-            // 如果JSON解析失败，回退到文本提取
-            const matches = data.match(ipRegex);
-            if (matches) ips.push(...matches);
-        }
-    }
-    else if (source.includes('stock.hostmonit.com')) {
-        // JSON格式处理
-        try {
-            const jsonData = JSON.parse(data);
-            if (jsonData && Array.isArray(jsonData.info)) {
-                jsonData.info.forEach(item => {
-                    if (item.ip && typeof item.ip === 'string') {
-                        const match = item.ip.match(ipRegex);
-                        if (match) ips.push(...match);
-                    }
-                });
-            }
-        } catch (e) {
-            const matches = data.match(ipRegex);
-            if (matches) ips.push(...matches);
-        }
-    }
-    else if (source.includes('wetest.vip')) {
-        // HTML表格处理
-        const tableMatches = data.match(/<td[^>]*>(\d+\.\d+\.\d+\.\d+)<\/td>/g);
-        if (tableMatches) {
-            tableMatches.forEach(td => {
-                const ipMatch = td.match(ipRegex);
-                if (ipMatch) ips.push(...ipMatch);
-            });
-        } else {
-            // 回退到通用IP提取
-            const matches = data.match(ipRegex);
-            if (matches) ips.push(...matches);
-        }
-    }
-    else {
-        // 通用处理：提取所有IP地址
-        const matches = data.match(ipRegex);
-        if (matches) ips.push(...matches);
-    }
-    
-    // 过滤有效的IP地址（排除本地和私有IP）
-    return ips.filter(ip => {
-        const parts = ip.split('.');
-        // 排除 0.x.x.x, 10.x.x.x, 127.x.x.x, 169.254.x.x, 172.16.x.x-172.31.x.x, 192.168.x.x
-        if (parts[0] === '0') return false;
-        if (parts[0] === '10') return false;
-        if (parts[0] === '127') return false;
-        if (parts[0] === '169' && parts[1] === '254') return false;
-        if (parts[0] === '172' && parseInt(parts[1]) >= 16 && parseInt(parts[1]) <= 31) return false;
-        if (parts[0] === '192' && parts[1] === '168') return false;
-        return true;
-    });
-            }
-                const ips = extractIPs(data);
-                allIPs = allIPs.concat(ips);
-                console.log(`从 ${source} 获得 ${ips.length} 个IP`);
-            } catch (err) {
-                console.log(`跳过 ${source}: ${err.message}`);
-            }
-        }
-
-        const uniqueIPs = [...new Set(allIPs)].sort();
-        const resultText = uniqueIPs.join('\n');
-
-        cache.data = resultText;
-        cache.timestamp = now;
-        console.log(`总计 ${uniqueIPs.length} 个唯一IP，缓存更新`);
-
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('X-Cache', 'MISS');
-        res.setHeader('X-Cache-Expire', new Date(now + cache.ttl).toISOString());
-        res.end(resultText);
-    } catch (error) {
-        console.error('全局错误:', error);
-        if (cache.data) {
-            console.log('返回陈旧缓存作为降级');
-            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.setHeader('X-Cache', 'HIT-FALLBACK');
-            return res.end(cache.data);
-        }
-        res.status(500).end('Error: ' + error.message);
-    }
-};
-
-function fetchData(url) {
-    return new Promise((resolve, reject) => {
-        const req = https.get(url, (response) => {
-            if (response.statusCode === 301 || response.statusCode === 302) {
-                return fetchData(response.headers.location).then(resolve).catch(reject);
-            }
-            if (response.statusCode !== 200) {
-                reject(new Error(`HTTP ${response.statusCode}`));
-                return;
-            }
-            let raw = '';
-            response.on('data', chunk => raw += chunk);
-            response.on('end', () => resolve(raw));
-        });
-        req.setTimeout(10000, () => {
-            req.destroy();
-            reject(new Error('请求超时'));
-        });
-        req.on('error', reject);
-    });
-}
-
-function extractIPs(data) {
-    // 使用简单、安全的正则（避免回溯爆炸）
-    const ipv4Regex = /\b(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/g;
-    const ipv6Regex = /\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b|\b[0-9a-fA-F]{1,4}::[0-9a-fA-F]{1,4}\b|\b::[0-9a-fA-F]{1,4}\b|\b[0-9a-fA-F]{1,4}::\b|\b::\b/g;
-
-    const matches4 = data.match(ipv4Regex) || [];
-    const matches6 = data.match(ipv6Regex) || [];
-    const all = [...matches4, ...matches6];
-
-    // 过滤私有/保留地址
-    return all.filter(ip => {
-        if (ip.includes('.')) {
-            const p = ip.split('.');
-            if (p[0] === '0' || p[0] === '10' || p[0] === '127') return false;
-            if (p[0] === '169' && p[1] === '254') return false;
-            if (p[0] === '172' && parseInt(p[1]) >= 16 && parseInt(p[1]) <= 31) return false;
-            if (p[0] === '192' && p[1] === '168') return false;
-            return true;
-        } else {
-            const lower = ip.toLowerCase();
-            if (lower === '::1' || lower === '::') return false;
-            if (lower.startsWith('fe80:') || lower.startsWith('fc') || lower.startsWith('fd') || lower.startsWith('ff')) return false;
-            return true;
-        }
-    });
-}    "https://stock.hostmonit.com/CloudFlareYes",
-    "https://stock.hostmonit.com/CloudFlareYesV6",
-    "https://www.wetest.vip/page/cloudflare/address_v4.html",
-    "https://www.wetest.vip/page/cloudflare/address_v6.html",
-    "https://api.urlce.com/cloudflare.html",
-  ];
-
-  let allIPs = [];
-
-  // 串行遍历数据源，单个请求8秒超时
-  for (const url of dataSources) {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 8000);
-      const res = await fetch(url, { signal: controller.signal });
-      clearTimeout(timeoutId);
-      if (!res.ok) continue;
-      const text = await res.text();
-      const ips = extractIPs(text, url);
-      allIPs.push(...ips);
-    } catch (e) {
-      continue;
-    }
-  }
-
-  // 去重 + 排序
-  const uniqueIPs = [...new Set(allIPs)].sort((a, b) => {
-    const aV4 = a.includes(".");
-    const bV4 = b.includes(".");
-    if (aV4 && !bV4) return -1;
-    if (!aV4 && bV4) return 1;
-    return a.localeCompare(b);
-  });
-
-  const result = uniqueIPs.join("\n");
-  cache.data = result;
-  cache.timestamp = now;
-
-  return new Response(result, {
-    headers: {
-      "Content-Type": "text/plain; charset=utf-8",
-      "Access-Control-Allow-Origin": "*",
-      "X-Cache": "MISS",
-    },
-  });
-}
-
-// IP提取+过滤函数
-function extractIPs(text, source) {
-  let list = [];
-  const v4 = text.match(ipv4Regex) || [];
-  const v6 = text.match(ipv6Regex) || [];
-  list.push(...v4, ...v6);
-
-  return list.filter((ip) => {
-    // IPv4私有地址过滤
-    if (ip.includes(".")) {
-      const seg = ip.split(".").map(Number);
-      if (seg[0] === 10) return false;
-      if (seg[0] === 127) return false;
-      if (seg[0] === 169 && seg[1] === 254) return false;
-      if (seg[0] === 172 && seg[1] >= 16 && seg[1] <= 31) return false;
-      if (seg[0] === 192 && seg[1] === 168) return false;
-      return true;
-    }
-    // IPv6私有地址过滤
-    const low = ip.toLowerCase();
-    for (const prefix of privateV6Prefix) {
-      if (low.startsWith(prefix)) return false;
-    }
-    return true;
-  });
 }
