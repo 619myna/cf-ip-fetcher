@@ -1,0 +1,10 @@
+{
+  "functions": {
+    "api/ip.js": {
+      "runtime": "nodejs18.x"
+    }
+  },
+  "rewrites": [
+    { "source": "/api/ip", "destination": "/api/ip.js" }
+  ]
+}
