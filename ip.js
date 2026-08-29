@@ -30,9 +30,9 @@ module.exports = async (req, res) => {
             'https://ipdb.api.030101.xyz/?type=bestcf',
             'https://ip.164746.xyz/ipTop.html', 
             'https://stock.hostmonit.com/CloudFlareYes',
-            'https://stock.hostmonit.com/CloudFlareYesV6',
+            //'https://stock.hostmonit.com/CloudFlareYesV6',
             'https://www.wetest.vip/page/cloudflare/address_v4.html',
-            'https://www.wetest.vip/page/cloudflare/address_v6.html',
+            //'https://www.wetest.vip/page/cloudflare/address_v6.html',
             'https://api.urlce.com/cloudflare.html'
         ];
 
