@@ -1,20 +1,32 @@
 const https = require('https');
+const http = require('http');
 const net = require('net');
 
-// 全局内存缓存
+// 内存缓存管理
 let cache = {
     data: null,
     timestamp: 0,
-    ttl: 60000 // 1分钟缓存，单位毫秒
+    ttl: 60000 // 1分钟缓存
 };
 
+// 预设 Cloudflare 应急保活 IP 列表（当所有数据源均被封禁时触发，保证服务不崩溃）
+const EMERGENCY_FALLBACK_IPS = [
+    '1.1.1.1',
+    '1.0.0.1',
+    '104.16.132.229',
+    '104.16.133.229',
+    '2606:4700:4700::1111',
+    '2606:4700:4700::1001'
+];
+
 module.exports = async (req, res) => {
+    // 强制全局异常捕获，确保绝对不向 Vercel 抛出未捕获异常
     try {
         const now = Date.now();
 
-        // 1. 优先检查缓存
+        // 1. 优先命中有效缓存
         if (cache.data && (now - cache.timestamp) < cache.ttl) {
-            console.log('返回缓存数据');
+            res.statusCode = 200;
             res.setHeader('Content-Type', 'text/plain; charset=utf-8');
             res.setHeader('Access-Control-Allow-Origin', '*');
             res.setHeader('X-Cache', 'HIT');
@@ -33,7 +45,210 @@ module.exports = async (req, res) => {
             'https://api.urlce.com/cloudflare.html'
         ];
 
-        // 2. 并发请求，硬超时 3.5 秒阻断，防止打爆 Vercel 10s 限制
+        // 2. 并发安全请求，每个数据源 3.0 秒硬超时限制
+        const fetchPromises = dataSources.map(source => 
+            safeHttpsFetch(source, 3000)
+                .then(data => ({ source, data }))
+                .catch(() => ({ source, data: '' }))
+        );
+
+        const results = await Promise.all(fetchPromises);
+        let allIPs = [];
+
+        results.forEach(result => {
+            if (result.data) {
+                const ips = extractIPs(result.data, result.source);
+                // 使用 safe push 方式防栈溢出
+                for (let i = 0; i < ips.length; i++) {
+                    allIPs.push(ips[i]);
+                }
+            }
+        });
+
+        // 3. 去重与排序（IPv4 排前，IPv6 排后，内部字典序）
+        let uniqueIPs = Array.from(new Set(allIPs)).sort((a, b) => {
+            const aV4 = a.includes(".");
+            const bV4 = b.includes(".");
+            if (aV4 && !bV4) return -1;
+            if (!aV4 && bV4) return 1;
+            return a.localeCompare(b);
+        });
+
+        let cacheStatus = 'MISS';
+
+        // 4. 数据容灾多级降级策略
+        if (uniqueIPs.length === 0) {
+            if (cache.data) {
+                // 第一级降级：使用旧缓存
+                res.statusCode = 200;
+                res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+                res.setHeader('Access-Control-Allow-Origin', '*');
+                res.setHeader('X-Cache', 'HIT-FALLBACK');
+                return res.end(cache.data);
+            } else {
+                // 第二级降级：使用应急保活 IP 列表，防止 500 崩溃
+                uniqueIPs = EMERGENCY_FALLBACK_IPS;
+                cacheStatus = 'EMERGENCY-FALLBACK';
+            }
+        }
+
+        const resultText = uniqueIPs.join('\n');
+        
+        // 更新缓存（非应急数据才写入缓存）
+        if (cacheStatus !== 'EMERGENCY-FALLBACK') {
+            cache.data = resultText;
+            cache.timestamp = now;
+        }
+
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('X-Cache', cacheStatus);
+        res.setHeader('X-Cache-Expire', new Date(now + cache.ttl).toISOString());
+        return res.end(resultText);
+
+    } catch (globalError) {
+        console.error('Fatal Handler Error:', globalError);
+        
+        // 最终兜底拦截，绝不向 Vercel 抛出错误
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('X-Cache', 'FATAL-RECOVERY');
+        return res.end(cache.data || EMERGENCY_FALLBACK_IPS.join('\n'));
+    }
+};
+
+/**
+ * 零崩溃 HTTP/HTTPS 请求器（带超时重定向与 5MB 体积保护）
+ */
+function safeHttpsFetch(urlStr, timeoutMs = 3000, maxRedirects = 2) {
+    return new Promise((resolve) => {
+        if (maxRedirects < 0) return resolve('');
+        
+        try {
+            const parsedUrl = new URL(urlStr);
+            const client = parsedUrl.protocol === 'https:' ? https : http;
+            
+            const req = client.get(urlStr, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Serverless/1.0',
+                    'Accept': 'text/html,application/json,text/plain'
+                }
+            }, (res) => {
+                // 处理重定向
+                if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                    try {
+                        const redirectUrl = new URL(res.headers.location, urlStr).toString();
+                        return safeHttpsFetch(redirectUrl, timeoutMs, maxRedirects - 1).then(resolve);
+                    } catch (e) {
+                        return resolve('');
+                    }
+                }
+
+                if (res.statusCode !== 200) {
+                    res.resume();
+                    return resolve('');
+                }
+
+                let data = '';
+                res.setEncoding('utf8');
+                res.on('data', chunk => {
+                    data += chunk;
+                    // 超过 5MB 强制截断防内存溢出
+                    if (data.length > 5 * 1024 * 1024) {
+                        req.destroy();
+                        resolve(data);
+                    }
+                });
+                res.on('end', () => resolve(data));
+            });
+
+            req.on('error', () => resolve(''));
+            req.setTimeout(timeoutMs, () => {
+                req.destroy();
+                resolve('');
+            });
+        } catch (e) {
+            resolve('');
+        }
+    });
+}
+
+/**
+ * 100% 线性时间 ReDoS 提取函数
+ */
+function extractIPs(data, source) {
+    if (!data || typeof data !== 'string') return [];
+    
+    const candidates = [];
+
+    // 1. 结构化 JSON 解析适配
+    if (source && (source.includes('ipdb.api.030101.xyz') || source.includes('stock.hostmonit.com'))) {
+        try {
+            const jsonData = JSON.parse(data);
+            const list = jsonData.data || jsonData.info || [];
+            if (Array.isArray(list)) {
+                list.forEach(item => {
+                    if (item && typeof item.ip === 'string') {
+                        candidates.push(item.ip.trim());
+                    }
+                });
+            }
+        } catch (e) {}
+    }
+
+    // 2. 无回溯 O(N) 正则扫描：提取所有长度 3-45 的 hex/dot/colon 连续字符串
+    const matches = data.match(/[0-9a-fA-F.:]{3,45}/g);
+    if (matches) {
+        for (let i = 0; i < matches.length; i++) {
+            const str = matches[i];
+            // 排除无 '.' 和 ':' 的普通十六进制字符串
+            if (str.includes('.') || str.includes(':')) {
+                const cleaned = str.replace(/^[.:]+|[.:]+$/g, '');
+                if (cleaned.length >= 3) {
+                    candidates.push(cleaned);
+                }
+            }
+        }
+    }
+
+    // 3. Node.js 底层 isIP 严格校验与私有地址过滤
+    return candidates.filter(ip => isPublicIP(ip));
+}
+
+/**
+ * 公网 IP 校验 (Node.js 原生 net.isIP)
+ */
+function isPublicIP(ip) {
+    const ipType = net.isIP(ip);
+
+    if (ipType === 4) {
+        const parts = ip.split('.').map(Number);
+        if (parts[0] === 0 || parts[0] === 10 || parts[0] === 127) return false;
+        if (parts[0] === 169 && parts[1] === 254) return false;
+        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return false;
+        if (parts[0] === 192 && parts[1] === 168) return false;
+        return true;
+    }
+
+    if (ipType === 6) {
+        const lower = ip.toLowerCase();
+        if (lower === '::' || lower === '::1') return false;
+        if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) return false;
+        if (lower.startsWith('fc') || lower.startsWith('fd')) return false;
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * 完整保留源码备用 fetchData 函数
+ */
+function fetchData(url) {
+    return safeHttpsFetch(url, 10000);
+}
         const fetchPromises = dataSources.map(source => 
             safeFetch(source, 3500)
                 .then(data => ({ source, data }))
